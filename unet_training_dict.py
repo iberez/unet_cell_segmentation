@@ -24,7 +24,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 import tifffile
 import numpy as np
-from scipy.io import loadmat
+from scipy.io import loadmat, whosmat
 
 import matplotlib
 matplotlib.use("Agg")  # no display on the server: draw straight to file
@@ -51,6 +51,13 @@ from monai.visualize import plot_2d_or_3d_image
 
 RAW_CHANNEL = 0       # which channel of the TIFF to train on
 MASK_KEY = "BW_I2"    # which mask in the .mat goes with that channel
+
+# --- image / mask size check ---
+SHAPE_TOLERANCE = 2   # pairs differing by up to this many pixels per side are trimmed to their common size;
+                      # set to 0 to drop every pair whose image and mask sizes differ
+
+# file path -> (rows, columns) to trim to; filled by check_pair_shapes() and applied by the two loaders
+CROP_TO = {}
 
 # --- patch sampling ---
 PATCH_SIZE = (256, 256)
@@ -112,12 +119,69 @@ def load_and_normalize_section(tiff_path, channel_axis=None):
     # Normalize in place; zero-range channels are already all 0 after the subtraction
     image -= channel_min
     np.divide(image, channel_range, out=image, where=channel_range > 0)
-    return image[RAW_CHANNEL][np.newaxis]
+    return trim_to_agreed_shape(image[RAW_CHANNEL][np.newaxis], tiff_path)
 
 def load_mask(mask_path):
     """Load the MASK_KEY mask from a BW_*.mat file as a float32 (1, Y, X) array of 0s and 1s."""
     mask = loadmat(mask_path, variable_names=[MASK_KEY])[MASK_KEY]
-    return (mask > 0).astype(np.float32)[np.newaxis]
+    return trim_to_agreed_shape((mask > 0).astype(np.float32)[np.newaxis], mask_path)
+
+
+def trim_to_agreed_shape(array, path):
+    """Trim a (1, Y, X) array to the size agreed for its image/mask pair, if check_pair_shapes() set one."""
+    if path in CROP_TO:
+        rows, cols = CROP_TO[path]
+        array = np.ascontiguousarray(array[:, :rows, :cols])
+    return array
+
+
+def tiff_spatial_shape(tiff_path):
+    """(Y, X) of a section TIFF, read from the file header without loading the pixels."""
+    with tifffile.TiffFile(tiff_path) as tif:
+        shape = list(tif.series[0].shape)
+    if len(shape) == 3:  # drop the channel axis, taken to be the shortest one as in load_and_normalize_section
+        shape.pop(int(np.argmin(shape)))
+    return tuple(shape)
+
+
+def check_pair_shapes(images, segs):
+    """Compare the size of every image with its mask, reading file headers only.
+
+    - same size: kept as is
+    - one of the two larger by at most SHAPE_TOLERANCE pixels per side: kept, and both are trimmed
+      to the common top-left region when loaded
+    - anything else (larger difference, or image larger one way and mask the other, which is what
+      a rotated or transposed mask looks like): dropped
+    Returns the kept images and masks.
+    """
+    kept_images, kept_segs, trimmed, dropped = [], [], [], []
+    for image, seg in zip(images, segs):
+        image_shape = tiff_spatial_shape(image)
+        mask_shape = next(tuple(shape) for name, shape, _ in whosmat(seg) if name == MASK_KEY)
+        differences = [i - m for i, m in zip(image_shape, mask_shape)]
+        report = f"{os.path.basename(image)}: image {image_shape}, mask {mask_shape}"
+        if image_shape == mask_shape:
+            pass
+        elif (
+            len(image_shape) == len(mask_shape)
+            and max(abs(d) for d in differences) <= SHAPE_TOLERANCE
+            and (min(differences) >= 0 or max(differences) <= 0)
+        ):
+            common = tuple(min(i, m) for i, m in zip(image_shape, mask_shape))
+            CROP_TO[image] = CROP_TO[seg] = common
+            trimmed.append(f"{report} -> both trimmed to {common}")
+        else:
+            dropped.append(report)
+            continue
+        kept_images.append(image)
+        kept_segs.append(seg)
+
+    print(f"size check: {len(images)} pairs, {len(trimmed)} trimmed to a common size, {len(dropped)} dropped")
+    for line in trimmed:
+        print(f"  trimmed  {line}")
+    for line in dropped:
+        print(f"  DROPPED  {line}")
+    return kept_images, kept_segs
 
 
 def section_key(path):
@@ -270,6 +334,9 @@ def main(data_dir):
 
     # pair each image with its own mask by name (the two folders differ in length)
     images, segs = pair_by_name(images, segs)
+
+    # every image must be the same size as its mask (checked from the file headers, for all pairs)
+    images, segs = check_pair_shapes(images, segs)
 
     # sanity check on one pair: both must be (1, Y, X) with identical Y and X
     first_image, first_mask = load_and_normalize_section(images[0]), load_mask(segs[0])
