@@ -49,6 +49,12 @@ from monai.transforms import (
 )
 from monai.visualize import plot_2d_or_3d_image
 
+# --- where things are (unet_evaluation_dict.py reads these too) ---
+DATA_DIR = "/zjbd/zd1/isaac/rabies_cnn"
+IMAGE_FOLDER = "112_02_single_section_raw_input"
+MASK_FOLDER = "112_02_single_section_seg_masks"
+MODEL_FILE = "best_metric_model_segmentation2d_array.pth"   # best weights, saved in the data directory
+
 RAW_CHANNEL = 0       # which channel of the TIFF to train on
 MASK_KEY = "BW_I2"    # which mask in the .mat goes with that channel
 
@@ -320,15 +326,10 @@ def save_loss_plot(history, plot_dir):
     return plot_path
 
 
-def main(data_dir):
-    monai.config.print_config()
-    logging.basicConfig(stream=sys.stdout, level=logging.INFO)
-    # sections whose mask is empty can only give background patches; MONAI warns about each one, every epoch
-    warnings.filterwarnings("ignore", message=".*unable to generate class balanced samples.*")
-
-    print(f"loading images and segmentations from {data_dir} (this may take a while)")
-    images = sorted(glob(os.path.join(data_dir, "112_02_single_section_raw_input", "*.tiff")))
-    segs = sorted(glob(os.path.join(data_dir, "112_02_single_section_seg_masks", "*.mat")))
+def list_pairs(data_dir):
+    """All usable image/mask pairs in data_dir: matched by name, then checked for size."""
+    images = sorted(glob(os.path.join(data_dir, IMAGE_FOLDER, "*.tiff")))
+    segs = sorted(glob(os.path.join(data_dir, MASK_FOLDER, "*.mat")))
     print (f"len images: {len(images)}")
     print (f"len segs: {len(segs)}")
 
@@ -336,7 +337,29 @@ def main(data_dir):
     images, segs = pair_by_name(images, segs)
 
     # every image must be the same size as its mask (checked from the file headers, for all pairs)
-    images, segs = check_pair_shapes(images, segs)
+    return check_pair_shapes(images, segs)
+
+
+def build_model():
+    """The network. unet_evaluation_dict.py builds the same one before loading the trained weights."""
+    return monai.networks.nets.UNet(
+        spatial_dims=2,
+        in_channels=1,
+        out_channels=1,
+        channels=(16, 32, 64, 128, 256),
+        strides=(2, 2, 2, 2),
+        num_res_units=2,
+    )
+
+
+def main(data_dir):
+    monai.config.print_config()
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+    # sections whose mask is empty can only give background patches; MONAI warns about each one, every epoch
+    warnings.filterwarnings("ignore", message=".*unable to generate class balanced samples.*")
+
+    print(f"loading images and segmentations from {data_dir} (this may take a while)")
+    images, segs = list_pairs(data_dir)
 
     # sanity check on one pair: both must be (1, Y, X) with identical Y and X
     first_image, first_mask = load_and_normalize_section(images[0]), load_mask(segs[0])
@@ -435,14 +458,7 @@ def main(data_dir):
     post_trans = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
     # create UNet, DiceLoss and Adam optimizer
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = monai.networks.nets.UNet(
-        spatial_dims=2,
-        in_channels=1,
-        out_channels=1,
-        channels=(16, 32, 64, 128, 256),
-        strides=(2, 2, 2, 2),
-        num_res_units=2,
-    ).to(device)
+    model = build_model().to(device)
     print(f"CUDA available: {torch.cuda.is_available()}, GPUs visible: {torch.cuda.device_count()}")
     print(f"model is on: {next(model.parameters()).device}")
 
@@ -541,7 +557,7 @@ def main(data_dir):
                 if metric > best_metric:
                     best_metric = metric
                     best_metric_epoch = epoch + 1
-                    torch.save(model.state_dict(), "best_metric_model_segmentation2d_array.pth")
+                    torch.save(model.state_dict(), os.path.join(data_dir, MODEL_FILE))
                     print("saved new best metric model")
                 print(
                     "  whole-section validation at epoch {}: mean dice {:.4f} (best {:.4f} at epoch {})".format(
@@ -562,5 +578,4 @@ def main(data_dir):
 
 
 if __name__ == "__main__":
-    data_dir = "/zjbd/zd1/isaac/rabies_cnn"
-    main(data_dir)
+    main(DATA_DIR)
