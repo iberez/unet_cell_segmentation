@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import math
 import os
@@ -56,9 +57,13 @@ PATCH_SIZE = (256, 256)
 NUM_SAMPLES = 8       # patches drawn from a section each time it comes up in a batch
 POS, NEG = 3, 1       # POS / (POS + NEG) = share of patches centred on a cell pixel (the rest: tissue background)
 
-# --- run length (one epoch is only len(train sections) / batch_size = 5 optimizer steps) ---
-NUM_EPOCHS = 400      # 400 epochs x 5 steps = 2,000 steps
-VAL_INTERVAL = 20
+# --- data split: whole slides go to train / val / test in this repeating order (5/7, 1/7, 1/7 of the slides) ---
+SPLIT_FILE = "split_by_slide.json"   # written once into the data directory, then reused so the test set never changes
+SPLIT_CYCLE = ("train", "train", "train", "val", "train", "train", "test")
+
+# --- run length (one epoch = number of training sections / batch_size steps, about 30 with ~120 sections) ---
+NUM_EPOCHS = 100
+VAL_INTERVAL = 5      # whole-section validation every this many epochs (patch validation runs every epoch)
 
 # --- output ---
 PLOT_FOLDER = "loss_vs_epochs_plots"   # created inside the data directory
@@ -143,29 +148,108 @@ def pair_by_name(images, segs):
     return [p[0] for p in pairs], [p[1] for p in pairs]
 
 
+def slide_of(path):
+    """The scanned slide a section was cut from: 'S013' for 'S013.tif_section_4_f.tiff'."""
+    return section_key(path).split(".tif_section_")[0]
+
+
+def split_by_slide(images, segs, split_path):
+    """Split the paired sections into train / val / test by slide (about 70 / 15 / 15 %).
+
+    All sections cut from one slide go to the same set. The assignment is written to split_path
+    the first time and read back on every later run, so the test sections stay the same.
+    """
+    slides = sorted({slide_of(p) for p in images})
+    if len(slides) == len(images):
+        print("WARNING: every section looks like its own slide; check slide_of() against your file names")
+
+    if os.path.exists(split_path):
+        with open(split_path) as f:
+            slide_split = json.load(f)["slides"]
+        unknown = [s for s in slides if s not in slide_split]
+        if unknown:
+            raise ValueError(
+                f"slides {unknown} are not listed in {split_path}; delete that file to redo the split "
+                "(note that this changes the test set)"
+            )
+        print(f"using the existing split in {split_path}")
+    else:
+        slide_split = {slide: SPLIT_CYCLE[i % len(SPLIT_CYCLE)] for i, slide in enumerate(slides)}
+        with open(split_path, "w") as f:
+            json.dump({"note": "slide -> split; delete this file to redo the split", "slides": slide_split}, f, indent=2)
+        print(f"new split written to {split_path}")
+
+    files = {"train": [], "val": [], "test": []}
+    for image, seg in zip(images, segs):
+        files[slide_split[slide_of(image)]].append({"image": image, "label": seg})
+    for name, members in files.items():
+        in_split = [s for s in slides if slide_split[s] == name]
+        print(f"  {name}: {len(members)} sections from {len(in_split)} slides {in_split}")
+    return files
+
+
+def evaluate_patches(model, images, labels, dice_loss, bce_loss, device, batch_size=32):
+    """Loss and Dice on a fixed set of patches, computed the same way as the training numbers."""
+    model.eval()
+    loss_sum = 0.0
+    n_batches = true_positive = predicted_pixels = cell_pixels = 0
+    with torch.no_grad():
+        for start in range(0, len(images), batch_size):
+            inputs = images[start : start + batch_size].to(device)
+            targets = labels[start : start + batch_size].to(device)
+            outputs = model(inputs)
+            loss_sum += (dice_loss(outputs, targets) + bce_loss(outputs, targets)).item()
+            n_batches += 1
+            predicted, truth = outputs > 0, targets > 0.5  # a logit above 0 is a probability above 0.5
+            true_positive += (predicted & truth).sum().item()
+            predicted_pixels += predicted.sum().item()
+            cell_pixels += truth.sum().item()
+    return loss_sum / n_batches, 2 * true_positive / max(predicted_pixels + cell_pixels, 1)
+
+
 def record_epoch(history, **values):
-    """Store one epoch's numbers, e.g. record_epoch(history, loss=1.02, dice_term=0.99, bce_term=0.03)."""
+    """Store one epoch's numbers, e.g. record_epoch(history, loss=0.31, val_loss=0.42)."""
     for name, value in values.items():
         history.setdefault(name, []).append(float(value))
 
 
 def save_loss_plot(history, plot_dir):
-    """Plot training loss against epoch and save it as a PDF in plot_dir; returns the file path."""
+    """Plot loss (left) and Dice (right) against epoch; save as a PDF in plot_dir and return the file path."""
     os.makedirs(plot_dir, exist_ok=True)
     logging.getLogger("fontTools").setLevel(logging.WARNING)  # font embedding is chatty at INFO level
     epochs = range(1, len(history["loss"]) + 1)
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(epochs, history["loss"], color="black", linewidth=2, label="training loss (Dice + cross-entropy)")
-    ax.plot(epochs, history["dice_term"], linestyle="--", label="Dice term")
-    ax.plot(epochs, history["bce_term"], linestyle="--", label="cross-entropy term")
-    ax.set_xlabel("epoch")
-    ax.set_ylabel("loss (mean over the epoch)")
-    ax.set_title(f"Training loss vs. epoch (raw channel {RAW_CHANNEL}, mask {MASK_KEY})")
-    ax.set_ylim(bottom=0)
-    ax.grid(alpha=0.3)
-    ax.legend()
+    fig, (ax_loss, ax_dice) = plt.subplots(1, 2, figsize=(14, 5))
 
+    # left: training and validation loss, both on patches drawn with the same sampling
+    ax_loss.plot(epochs, history["loss"], color="black", linewidth=2, label="training (mean over the epoch)")
+    if "val_loss" in history:
+        ax_loss.plot(epochs, history["val_loss"], color="tab:red", linewidth=2, label="validation (fixed patches)")
+    ax_loss.set_xlabel("epoch")
+    ax_loss.set_ylabel("loss (Dice + cross-entropy)")
+    ax_loss.set_title("Loss vs. epoch")
+    ax_loss.set_ylim(bottom=0)
+    ax_loss.grid(alpha=0.3)
+    ax_loss.legend()
+
+    # right: the same comparison as Dice, plus the whole-section validation score
+    if "train_patch_dice" in history:
+        ax_dice.plot(epochs, history["train_patch_dice"], color="black", linewidth=2, label="training patches")
+    if "val_patch_dice" in history:
+        ax_dice.plot(epochs, history["val_patch_dice"], color="tab:red", linewidth=2, label="validation patches")
+    if "section_dice" in history:
+        ax_dice.plot(
+            history["section_dice_epoch"], history["section_dice"],
+            color="tab:blue", marker="o", linestyle="--", label="whole validation sections (mean)",
+        )
+    ax_dice.set_xlabel("epoch")
+    ax_dice.set_ylabel("Dice of thresholded predictions")
+    ax_dice.set_title("Dice vs. epoch")
+    ax_dice.set_ylim(0, 1)
+    ax_dice.grid(alpha=0.3)
+    ax_dice.legend(loc="lower right")
+
+    fig.suptitle(f"raw channel {RAW_CHANNEL}, mask {MASK_KEY}")
     plot_path = os.path.join(plot_dir, f"loss_vs_epochs_{datetime.now():%Y%m%d_%H%M%S}.pdf")
     fig.savefig(plot_path, transparent=True, bbox_inches="tight")
     plt.close(fig)
@@ -192,9 +276,10 @@ def main(data_dir):
     print(f"first pair: image {first_image.shape}, mask {first_mask.shape}, mask pixels = {int(first_mask.sum())}")
     assert first_image.shape == first_mask.shape, "image and mask shapes differ"
 
-    # one dictionary per section, so the image and its mask travel through the transforms together
-    files = [{"image": image, "label": seg} for image, seg in zip(images, segs)]
-    train_files, val_files = files[:20], files[-20:]
+    # one dictionary per section, so the image and its mask travel through the transforms together;
+    # whole slides are assigned to train / val / test, and the assignment is kept in a file
+    files = split_by_slide(images, segs, os.path.join(data_dir, SPLIT_FILE))
+    train_files, val_files = files["train"], files["val"]  # files["test"] is deliberately not touched in this script
 
     train_transforms = Compose(
         [
@@ -231,13 +316,35 @@ def main(data_dir):
         train_ds,
         batch_size=4,
         shuffle=True,
-        num_workers=4,
+        num_workers=8,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=True,  # an epoch is only 5 steps, so don't restart the workers every time
+        persistent_workers=True,  # keep the workers alive between epochs
+        drop_last=True,  # no small leftover batch: Dice over the batch needs a decent mix of patches
     )
     # validation data: whole sections, one at a time
     val_ds = CacheDataset(val_files, val_transforms, cache_rate=1.0, num_workers=8, progress=False)
     val_loader = DataLoader(val_ds, batch_size=1, num_workers=2, pin_memory=torch.cuda.is_available())
+
+    # A fixed set of validation patches, drawn once with exactly the sampling used for training.
+    # Loss and Dice on these are directly comparable with the training numbers; the whole-section
+    # validation further down is a different, much harder measurement.
+    val_sampler = RandCropByPosNegLabeld(
+        keys=["image", "label"],
+        label_key="label",
+        spatial_size=PATCH_SIZE,
+        pos=POS,
+        neg=NEG,
+        num_samples=NUM_SAMPLES,
+        image_key="image",
+        image_threshold=0,
+    )
+    val_sampler.set_random_state(seed=0)
+    val_patches = [patch for i in range(len(val_ds)) for patch in val_sampler(val_ds[i])]
+    # shuffle once so that every batch mixes patches from many sections, as the training batches do
+    order = torch.randperm(len(val_patches), generator=torch.Generator().manual_seed(0)).tolist()
+    val_patch_images = torch.stack([val_patches[i]["image"].as_subclass(torch.Tensor) for i in order])
+    val_patch_labels = torch.stack([val_patches[i]["label"].as_subclass(torch.Tensor) for i in order])
+    print(f"validation patches: {len(val_patch_images)} fixed patches from {len(val_ds)} sections")
 
     # sampling check: how many training patches actually contain a cell?
     sections_with_cells = sum(bool(load_mask(f["label"]).any()) for f in train_files)
@@ -332,12 +439,16 @@ def main(data_dir):
             writer.add_scalar("train_dice_term", dice_term.item(), global_step)
             writer.add_scalar("train_bce_term", bce_term.item(), global_step)
         epoch_loss /= step
-        record_epoch(history, loss=epoch_loss, dice_term=epoch_dice_term / step, bce_term=epoch_bce_term / step)
-        # Dice of the thresholded predictions on this epoch's training patches (easier than whole sections)
+        # Dice of the thresholded predictions on this epoch's training patches
         train_dice = 2 * true_positive / max(predicted_pixels + cell_pixels, 1)
+        # the same two numbers on the fixed validation patches
+        val_loss, val_patch_dice = evaluate_patches(model, val_patch_images, val_patch_labels, dice_loss, bce_loss, device)
+        record_epoch(history, loss=epoch_loss, val_loss=val_loss, train_patch_dice=train_dice, val_patch_dice=val_patch_dice)
+        writer.add_scalar("val_patch_loss", val_loss, epoch + 1)
+        writer.add_scalar("val_patch_dice", val_patch_dice, epoch + 1)
         print(
-            f"epoch {epoch + 1}/{NUM_EPOCHS}: loss {epoch_loss:.4f} = dice {epoch_dice_term / step:.4f} + bce {epoch_bce_term / step:.4f}"
-            f" | train patch dice {train_dice:.4f} | predicted {int(predicted_pixels)} px, true {int(cell_pixels)} px"
+            f"epoch {epoch + 1}/{NUM_EPOCHS}: train loss {epoch_loss:.4f} (dice {epoch_dice_term / step:.4f} + bce {epoch_bce_term / step:.4f}),"
+            f" patch dice {train_dice:.4f} | val loss {val_loss:.4f}, patch dice {val_patch_dice:.4f}"
         )
 
         if (epoch + 1) % val_interval == 0:
@@ -359,13 +470,14 @@ def main(data_dir):
                 # reset the status for next validation round
                 dice_metric.reset()
                 metric_values.append(metric)
+                record_epoch(history, section_dice_epoch=epoch + 1, section_dice=metric)
                 if metric > best_metric:
                     best_metric = metric
                     best_metric_epoch = epoch + 1
                     torch.save(model.state_dict(), "best_metric_model_segmentation2d_array.pth")
                     print("saved new best metric model")
                 print(
-                    "current epoch: {} current mean dice: {:.4f} best mean dice: {:.4f} at epoch {}".format(
+                    "  whole-section validation at epoch {}: mean dice {:.4f} (best {:.4f} at epoch {})".format(
                         epoch + 1, metric, best_metric, best_metric_epoch
                     )
                 )
