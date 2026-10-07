@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import csv
 import json
 import logging
 import math
@@ -57,6 +58,10 @@ MODEL_FILE = "best_metric_model_segmentation2d_array.pth"   # best weights, save
 
 RAW_CHANNEL = 0       # which channel of the TIFF to train on
 MASK_KEY = "BW_I2"    # which mask in the .mat goes with that channel
+
+# --- masks that mark cells with fixed-size dots instead of outlines (listed by unet_mask_audit.py) ---
+EXCLUDE_DOT_MASKS = True       # leave those sections out of training and validation
+AUDIT_FILE = "mask_audit.csv"  # written into the data directory by unet_mask_audit.py
 
 # --- image / mask size check ---
 SHAPE_TOLERANCE = 2   # pairs differing by up to this many pixels per side are trimmed to their common size;
@@ -326,6 +331,21 @@ def save_loss_plot(history, plot_dir):
     return plot_path
 
 
+def drop_dot_sections(files, data_dir, split_name):
+    """Remove the sections whose mask marks cells with dots, according to the audit file."""
+    audit_path = os.path.join(data_dir, AUDIT_FILE)
+    if not os.path.exists(audit_path):
+        raise SystemExit(f"{audit_path} not found: run unet_mask_audit.py first (it lists which masks are dots)")
+    with open(audit_path, newline="") as f:
+        kind_of = {row["section"]: row["annotation"] for row in csv.DictReader(f)}
+    unknown = [section_key(item["image"]) for item in files if section_key(item["image"]) not in kind_of]
+    if unknown:
+        raise SystemExit(f"{len(unknown)} sections are not in {audit_path} (e.g. {unknown[0]}): run unet_mask_audit.py again")
+    kept = [item for item in files if kind_of[section_key(item["image"])] != "dots"]
+    print(f"  {split_name}: {len(files) - len(kept)} dot-annotated sections left out, {len(kept)} kept")
+    return kept
+
+
 def list_pairs(data_dir):
     """All usable image/mask pairs in data_dir: matched by name, then checked for size."""
     images = sorted(glob(os.path.join(data_dir, IMAGE_FOLDER, "*.tiff")))
@@ -370,6 +390,9 @@ def main(data_dir):
     # whole slides are assigned to train / val / test, and the assignment is kept in a file
     files = split_by_slide(images, segs, os.path.join(data_dir, SPLIT_FILE))
     train_files, val_files = files["train"], files["val"]  # files["test"] is deliberately not touched in this script
+    if EXCLUDE_DOT_MASKS:
+        train_files = drop_dot_sections(train_files, data_dir, "train")
+        val_files = drop_dot_sections(val_files, data_dir, "val")
 
     train_transforms = Compose(
         [

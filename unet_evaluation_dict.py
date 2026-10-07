@@ -8,8 +8,8 @@ patch size, the slide split) is imported from unet_training_dict.py, which must 
 
 The masks come in two kinds, and each section is scored according to its kind:
     outlines   every cell is drawn as a shape      -> pixel Dice, and cells matched by overlap (IoU)
-    dots       every cell is a small fixed marker  -> a cell is found if the marker's centre lies inside
-                                                      a predicted object; Dice and outlines mean nothing
+    dots       every cell is a small fixed marker  -> a cell is found if a predicted object touches the
+                                                      marker; Dice and outlines mean nothing
 
 Results go to <data directory>/evaluation/<split>_<date>_<time>/ :
     summary.txt            the numbers printed at the end
@@ -42,6 +42,10 @@ SW_BATCH_SIZE = 16    # windows per forward pass (affects speed only)
 # are discarded before scoring. The surround was cut out with a coarse mask, so that edge is artificial.
 # Set to 0 to keep everything (and to reproduce the mean Dice of the training log exactly).
 EDGE_MARGIN = 8
+
+# Predicted objects smaller than this many pixels are discarded before scoring (0 = keep all). The summary
+# prints a table of what different values would do, so choose it from a validation run.
+MIN_OBJECT_AREA = 0
 
 # Outlined cells: an annotated cell and a predicted object are compared by IoU = overlap / union.
 FOUND_IOU = 0.1       # the cell counts as "found" from this IoU up ...
@@ -91,13 +95,27 @@ def remove_edge_objects(predicted, truth, image):
     return predicted & ~removed, len(at_edge), on_cells, cells_at_edge
 
 
+def remove_small_objects(predicted, truth):
+    """Drop predicted objects smaller than MIN_OBJECT_AREA pixels.
+
+    Returns the cleaned mask, the number of objects removed, and how many of those overlapped an annotated cell.
+    """
+    if MIN_OBJECT_AREA <= 0:
+        return predicted, 0, 0
+    labels, _ = ndimage.label(predicted, structure=STRUCTURE)
+    small = np.flatnonzero(np.bincount(labels.ravel())[1:] < MIN_OBJECT_AREA) + 1
+    removed = np.isin(labels, small) & predicted
+    return predicted & ~removed, len(small), len(np.unique(labels[removed & truth]))
+
+
 def match_objects(truth, predicted):
     """Compare annotated cells with predicted objects in one section.
 
     Both masks are split into connected objects. Two comparisons are made:
-    - by overlap: every overlapping (cell, object) pair gets an IoU, and pairs are accepted best-first,
+    - by IoU: every overlapping (cell, object) pair gets an IoU, and pairs are accepted best-first,
       each cell and each object used at most once (one blob over three cells is credited with one);
-    - by centre: which predicted object, if any, contains the centre of each annotated cell.
+    - by touch: whether a cell shares any pixel with a predicted object, and how many cells each
+      object touches (this is what counts for dot markers, where shapes mean nothing).
     """
     true_labels, n_true = ndimage.label(truth, structure=STRUCTURE)
     pred_labels, n_pred = ndimage.label(predicted, structure=STRUCTURE)
@@ -125,20 +143,20 @@ def match_objects(truth, predicted):
         boxes = ndimage.find_objects(labels)
         return np.array([[(s.start + s.stop) // 2 for s in box] for box in boxes], dtype=int).reshape(-1, 2)
 
-    cell_centres, object_centres = centres(true_labels), centres(pred_labels)
-    centre_object = pred_labels[cell_centres[:, 0], cell_centres[:, 1]]   # object under each cell centre (0 = none)
+    cell_touched = np.zeros(n_true + 1, dtype=bool)
+    cell_touched[cell] = True
     return {
         "n_true": n_true,
         "n_pred": n_pred,
         "cell_area": true_area[1:],                     # per annotated cell
         "cell_iou": cell_iou[1:],
         "matched_object_area": np.where(cell_object[1:] > 0, pred_area[cell_object[1:]], 0),  # 0 if missed
-        "cell_centre_covered": centre_object > 0,
+        "cell_touched": cell_touched[1:],               # shares at least one pixel with a predicted object
         "object_area": pred_area[1:],                   # per predicted object
         "object_matched": object_taken[1:],
-        "object_cell_centres": np.bincount(centre_object, minlength=n_pred + 1)[1:],  # cell centres inside it
-        "cell_centres": cell_centres,                   # (row, column)
-        "object_centres": object_centres,
+        "object_cells_touched": np.bincount(obj, minlength=n_pred + 1)[1:],  # annotated cells it overlaps
+        "cell_centres": centres(true_labels),           # (row, column)
+        "object_centres": centres(pred_labels),
     }
 
 
@@ -244,18 +262,24 @@ def summarise(rows, pooled, split, weights_path):
     with_cells = by_kind["outlines"] + by_kind["dots"]
 
     lines = [
-        f"split: {split}   weights: {weights_path}   threshold: {THRESHOLD}   edge margin: {EDGE_MARGIN} px",
+        f"split: {split}   weights: {weights_path}   threshold: {THRESHOLD}   edge margin: {EDGE_MARGIN} px"
+        f"   minimum object area: {MIN_OBJECT_AREA} px",
         f"sections: {len(rows)}  ({len(by_kind['outlines'])} with outlined cells, {len(by_kind['dots'])} with dot markers, "
         f"{len(by_kind['empty'])} with an empty mask)",
         f"mean Dice per section over all sections with cells: "
         f"{np.mean([row['dice'] for row in with_cells]) if with_cells else float('nan'):.4f}"
-        "   (the training-log number when the edge margin is 0; it mixes outlines and dots)",
+        "   (mixes outlines and dots; equals the training-log number only with both filters off)",
     ]
     if EDGE_MARGIN > 0:
         lines.append(
             f"edge filter: {total(rows, 'edge_objects_removed')} predicted objects within {EDGE_MARGIN} px of the black "
             f"surround were discarded; {total(rows, 'edge_objects_on_cells')} of them overlapped an annotated cell; "
             f"{total(rows, 'cells_at_edge')} annotated cells lie in that band"
+        )
+    if MIN_OBJECT_AREA > 0:
+        lines.append(
+            f"size filter: {total(rows, 'small_objects_removed')} predicted objects smaller than {MIN_OBJECT_AREA} px "
+            f"were discarded; {total(rows, 'small_objects_on_cells')} of them overlapped an annotated cell"
         )
 
     group = by_kind["outlines"]
@@ -284,19 +308,28 @@ def summarise(rows, pooled, split, weights_path):
             )
         if len(pooled["false_alarm_area"]):
             lines.append(f"  median area of a false alarm: {np.median(pooled['false_alarm_area']):.0f} px")
+        # what a (larger) minimum object area would do, judged from the sizes of today's objects
+        found_object_area = pooled["matched_object_area"][pooled["cell_iou"] >= FOUND_IOU]
+        false_alarms = total(group, "false_alarms")
+        lines += ["  what a size filter would do:", "      minimum area    false alarms left    found cells kept"]
+        for area in (0, 10, 20, 30, 40, 50, 75, 100):
+            left, kept = int((pooled["false_alarm_area"] >= area).sum()), int((found_object_area >= area).sum())
+            lines.append(
+                f"      {area:>8} px    {left:>6} ({share(left, false_alarms):>6})    {kept:>6} ({share(kept, found):>6})"
+            )
 
     group = by_kind["dots"]
     if group:
         cells, objects, found = total(group, "cells"), total(group, "objects"), total(group, "found")
         lines += [
             "",
-            f"SECTIONS WITH DOT MARKERS ({len(group)})   (found = the marker's centre lies inside a predicted object)",
+            f"SECTIONS WITH DOT MARKERS ({len(group)})   (found = a predicted object touches the marker)",
             f"  annotated cells: {cells}    predicted objects: {objects}",
             f"  found:         {found}  ({share(found, cells)} of annotated cells)",
             f"  missed:        {cells - found}  ({share(cells - found, cells)} of annotated cells)",
             f"  false alarms:  {total(group, 'false_alarms')}  ({share(total(group, 'false_alarms'), objects)} of predicted "
-            "objects; these contain no marker)",
-            f"  merged:        {total(group, 'merged_objects')} predicted objects contain more than one marker "
+            "objects; these touch no marker)",
+            f"  merged:        {total(group, 'merged_objects')} predicted objects touch more than one marker "
             f"({total(group, 'cells_in_merged_objects')} markers in all)",
         ]
 
@@ -345,13 +378,14 @@ def main():
             predicted = predict_section(model, image, device)     # (Y, X) bool
             image = image[0]
             predicted, edge_removed, edge_on_cells, cells_at_edge = remove_edge_objects(predicted, truth, image)
+            predicted, small_removed, small_on_cells = remove_small_objects(predicted, truth)
 
             match = match_objects(truth, predicted)
             kind = annotation_type(match["cell_area"])
             if kind == "dots":  # point markers: judge by position only
-                found = match["cell_centre_covered"]
+                found = match["cell_touched"]
                 close = np.zeros(match["n_true"], dtype=bool)
-                false_alarm = match["object_cell_centres"] == 0
+                false_alarm = match["object_cells_touched"] == 0
             else:               # outlined cells (or an empty mask): judge by overlap
                 found = match["cell_iou"] >= FOUND_IOU
                 close = match["cell_iou"] >= CLOSE_IOU
@@ -361,7 +395,7 @@ def main():
             overlap = int((truth & predicted).sum())
             true_pixels, predicted_pixels = int(truth.sum()), int(predicted.sum())
             dice = 2 * overlap / (true_pixels + predicted_pixels) if true_pixels else float("nan")
-            merged = match["object_cell_centres"] > 1
+            merged = match["object_cells_touched"] > 1
             rows.append(
                 {
                     "section": name,
@@ -378,10 +412,12 @@ def main():
                     "predicted_pixels": predicted_pixels,
                     "overlap_pixels": overlap,
                     "merged_objects": int(merged.sum()),
-                    "cells_in_merged_objects": int(match["object_cell_centres"][merged].sum()),
+                    "cells_in_merged_objects": int(match["object_cells_touched"][merged].sum()),
                     "edge_objects_removed": edge_removed,
                     "edge_objects_on_cells": edge_on_cells,
                     "cells_at_edge": cells_at_edge,
+                    "small_objects_removed": small_removed,
+                    "small_objects_on_cells": small_on_cells,
                 }
             )
             if kind == "outlines":
