@@ -16,6 +16,7 @@ import math
 import os
 import sys
 import warnings
+import zlib
 from datetime import datetime
 from glob import glob
 
@@ -47,6 +48,7 @@ from monai.transforms import (
     LoadImage,
     RandCropByPosNegLabeld,
     RandRotated,
+    Transform,
 )
 from monai.visualize import plot_2d_or_3d_image
 
@@ -69,6 +71,12 @@ SHAPE_TOLERANCE = 2   # pairs differing by up to this many pixels per side are t
 
 # file path -> (rows, columns) to trim to; filled by check_pair_shapes() and applied by the two loaders
 CROP_TO = {}
+
+# --- hard negatives: places where an earlier model raised false alarms on the training sections ---
+HARD_NEGATIVE_FILE = "hard_negatives.csv"  # written into the data directory by: python3 unet_evaluation_dict.py --split train
+HARD_NEGATIVE_SHARE = 0.5          # share of the background-centred patches drawn at those places (0 = don't use them)
+HARD_NEGATIVE_MIN_DISTANCE = 40    # use only false alarms at least this many pixels from every annotated cell (0 = use all)
+BACKGROUND_CENTRES = 50000         # ordinary background patch centres kept per section
 
 # --- patch sampling ---
 PATCH_SIZE = (256, 256)
@@ -346,6 +354,64 @@ def drop_dot_sections(files, data_dir, split_name):
     return kept
 
 
+def load_hard_negatives(data_dir):
+    """section name -> array of (row, column) false-alarm positions, or None if there is nothing to use.
+
+    Reads the file written by `python3 unet_evaluation_dict.py --split train`, keeping the false alarms
+    that lie at least HARD_NEGATIVE_MIN_DISTANCE pixels from every annotated cell.
+    """
+    path = os.path.join(data_dir, HARD_NEGATIVE_FILE)
+    if HARD_NEGATIVE_SHARE <= 0 or not os.path.exists(path):
+        return None
+    positions = {}
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            if float(row["distance_to_cell_px"]) >= HARD_NEGATIVE_MIN_DISTANCE:
+                positions.setdefault(row["section"], []).append((int(row["row"]), int(row["col"])))
+    return {section: np.array(points, dtype=np.int64) for section, points in positions.items()}
+
+
+def sampling_centres(label, image, hard_positions, seed):
+    """Flat pixel indices from which patch centres are drawn: (cell pixels, background pixels).
+
+    label, image: 2D arrays (Y, X). The background list holds up to BACKGROUND_CENTRES random tissue
+    pixels without a cell. If hard_positions (N x 2 array of row, column) is given, those places are
+    added to it, repeated often enough to make up HARD_NEGATIVE_SHARE of the list.
+    """
+    rng = np.random.default_rng(seed)
+    cells = np.flatnonzero(label)
+    background = np.flatnonzero((image > 0) & ~label)
+    if len(background) > BACKGROUND_CENTRES:
+        background = rng.choice(background, size=BACKGROUND_CENTRES, replace=False)
+
+    if hard_positions is not None and len(hard_positions) and len(background):
+        rows, cols = hard_positions[:, 0], hard_positions[:, 1]
+        inside = (rows >= 0) & (rows < label.shape[0]) & (cols >= 0) & (cols < label.shape[1])
+        hard = rows[inside] * label.shape[1] + cols[inside]
+        hard = hard[~label.ravel()[hard]]  # a "negative" patch is never centred on an annotated cell
+        if len(hard):
+            share = min(HARD_NEGATIVE_SHARE, 0.95)
+            n_hard = int(round(len(background) * share / (1 - share)))
+            background = np.concatenate([background, rng.choice(hard, size=n_hard, replace=True)])
+    return cells, background
+
+
+class AddSamplingCentres(Transform):
+    """Work out the patch-centre lists for one section and store them for RandCropByPosNegLabeld.
+
+    Not random, so CacheDataset runs it once per section. Uses and removes the "hard_negatives" entry.
+    """
+
+    def __call__(self, data):
+        d = dict(data)
+        to_numpy = lambda x: x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
+        label, image = to_numpy(d["label"])[0] > 0.5, to_numpy(d["image"])[0]
+        d["cell_centres"], d["background_centres"] = sampling_centres(
+            label, image, d.pop("hard_negatives", None), seed=zlib.crc32(str(label.shape).encode()) + int(label.sum())
+        )
+        return d
+
+
 def list_pairs(data_dir):
     """All usable image/mask pairs in data_dir: matched by name, then checked for size."""
     images = sorted(glob(os.path.join(data_dir, IMAGE_FOLDER, "*.tiff")))
@@ -394,13 +460,34 @@ def main(data_dir):
         train_files = drop_dot_sections(train_files, data_dir, "train")
         val_files = drop_dot_sections(val_files, data_dir, "val")
 
+    # hard negatives: false alarms of an earlier model on these sections, if they have been collected
+    hard_negatives = load_hard_negatives(data_dir)
+    if hard_negatives is None:
+        print(f"hard negatives: none in use (no {HARD_NEGATIVE_FILE}, or HARD_NEGATIVE_SHARE is 0)")
+        centre_step, centre_keys = [], {"image_key": "image", "image_threshold": 0}
+    else:
+        n_places = n_sections = 0
+        for item in train_files:
+            item["hard_negatives"] = hard_negatives.get(section_key(item["image"]), np.zeros((0, 2), dtype=np.int64))
+            n_places += len(item["hard_negatives"])
+            n_sections += len(item["hard_negatives"]) > 0
+        print(
+            f"hard negatives: {n_places} false alarms at least {HARD_NEGATIVE_MIN_DISTANCE} px from any annotated cell, "
+            f"in {n_sections} of {len(train_files)} training sections; in those sections "
+            f"{100 * HARD_NEGATIVE_SHARE:.0f}% of the background-centred patches are drawn there"
+        )
+        centre_step = [AddSamplingCentres()]
+        centre_keys = {"fg_indices_key": "cell_centres", "bg_indices_key": "background_centres"}
+
     train_transforms = Compose(
         [
             # deterministic loading: CacheDataset runs these once per section and keeps the result in RAM
             Lambdad(keys="image", func=load_and_normalize_section),
             Lambdad(keys="label", func=load_mask),
+            *centre_step,
             # foreground-aware sampling: NUM_SAMPLES patches per section, each centred either on a
-            # cell pixel (label == 1) or on a tissue pixel without a cell (label == 0 and image > 0)
+            # cell pixel (label == 1) or on a tissue pixel without a cell (label == 0 and image > 0);
+            # with hard negatives, the centres come from the lists prepared by AddSamplingCentres
             RandCropByPosNegLabeld(
                 keys=["image", "label"],
                 label_key="label",
@@ -408,8 +495,7 @@ def main(data_dir):
                 pos=POS,
                 neg=NEG,
                 num_samples=NUM_SAMPLES,
-                image_key="image",
-                image_threshold=0,
+                **centre_keys,
             ),
             # same random angle (within +/- 0.4 rad) for image and mask; "nearest" keeps the mask 0/1
             RandRotated(keys=["image", "label"], prob=0.5, range_x=0.4, mode=("bilinear", "nearest")),

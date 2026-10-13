@@ -14,9 +14,14 @@ The masks come in two kinds, and each section is scored according to its kind:
 Results go to <data directory>/evaluation/<split>_<date>_<time>/ :
     summary.txt            the numbers printed at the end
     sections.csv           the same counts, one row per section
+    false_alarms.csv       every false alarm: where it is, how big, how far from the nearest annotated cell
     gallery.pdf            close-ups of missed cells, false alarms, and found cells
     sections_overview.pdf  one page per section showing where the hits, misses and false alarms are
     predicted_masks/       the predicted mask of every section as a PNG (0 = background, 255 = cell)
+
+Run on the training slides (--split train), it also writes hard_negatives.csv into the data directory:
+the false alarms of the current model on the sections it was trained on. unet_training_dict.py reads
+that file and draws extra background patches at those places.
 """
 
 import argparse
@@ -28,6 +33,7 @@ import numpy as np
 import torch
 from PIL import Image
 from scipy import ndimage
+from scipy.spatial import cKDTree
 
 from monai.inferers import sliding_window_inference
 
@@ -44,8 +50,12 @@ SW_BATCH_SIZE = 16    # windows per forward pass (affects speed only)
 EDGE_MARGIN = 8
 
 # Predicted objects smaller than this many pixels are discarded before scoring (0 = keep all). The summary
-# prints a table of what different values would do, so choose it from a validation run.
-MIN_OBJECT_AREA = 0
+# prints a table of what larger values would do, so choose it from a validation run. 20 px was chosen from
+# the validation run of 8 October: it removed half of the false alarms and 5 of 1210 found cells.
+MIN_OBJECT_AREA = 20
+
+# A false alarm closer than this to an annotated cell (centre to centre) is counted as "near a cell".
+NEAR_CELL_DISTANCE = 40
 
 # Outlined cells: an annotated cell and a predicted object are compared by IoU = overlap / union.
 FOUND_IOU = 0.1       # the cell counts as "found" from this IoU up ...
@@ -285,6 +295,7 @@ def summarise(rows, pooled, split, weights_path):
     group = by_kind["outlines"]
     if group:
         cells, objects, found = total(group, "cells"), total(group, "objects"), total(group, "found")
+        false_alarms_n = total(group, "false_alarms")
         overlap, both_sizes = total(group, "overlap_pixels"), total(group, "true_pixels") + total(group, "predicted_pixels")
         found_iou = pooled["cell_iou"][pooled["cell_iou"] >= FOUND_IOU]
         lines += [
@@ -307,11 +318,18 @@ def summarise(rows, pooled, split, weights_path):
                 f"{np.median(pooled['matched_object_area'][pooled['cell_iou'] >= FOUND_IOU]):.0f} px"
             )
         if len(pooled["false_alarm_area"]):
-            lines.append(f"  median area of a false alarm: {np.median(pooled['false_alarm_area']):.0f} px")
+            near = int((pooled["false_alarm_distance"] < NEAR_CELL_DISTANCE).sum())
+            lines.append(
+                f"  median area of a false alarm: {np.median(pooled['false_alarm_area']):.0f} px; "
+                f"{near} of them lie within {NEAR_CELL_DISTANCE} px of an annotated cell, {false_alarms_n - near} farther away"
+            )
         # what a (larger) minimum object area would do, judged from the sizes of today's objects
         found_object_area = pooled["matched_object_area"][pooled["cell_iou"] >= FOUND_IOU]
         false_alarms = total(group, "false_alarms")
-        lines += ["  what a size filter would do:", "      minimum area    false alarms left    found cells kept"]
+        lines += [
+            f"  what a larger minimum object area would do (objects under {MIN_OBJECT_AREA} px are already gone):",
+            "      minimum area    false alarms left    found cells kept",
+        ]
         for area in (0, 10, 20, 30, 40, 50, 75, 100):
             left, kept = int((pooled["false_alarm_area"] >= area).sum()), int((found_object_area >= area).sum())
             lines.append(
@@ -366,8 +384,8 @@ def main():
     os.makedirs(os.path.join(out_dir, "predicted_masks"))
     rng = np.random.default_rng(0)
     examples = {category: [] for category in CATEGORIES}
-    pooled = {"cell_iou": [], "cell_area": [], "matched_object_area": [], "false_alarm_area": []}  # outlined sections
-    rows = []
+    pooled = {"cell_iou": [], "cell_area": [], "matched_object_area": [], "false_alarm_area": [], "false_alarm_distance": []}
+    rows, false_alarm_rows = [], []  # `pooled` covers the outlined sections only
 
     print(f"evaluating {len(files)} sections of the {args.split} slides on {device}...")
     with PdfPages(os.path.join(out_dir, "sections_overview.pdf")) as overview:
@@ -420,10 +438,30 @@ def main():
                     "small_objects_on_cells": small_on_cells,
                 }
             )
+            # every false alarm: position, size, and distance to the nearest annotated cell (centre to centre)
+            alarm_centres, alarm_areas = match["object_centres"][false_alarm], match["object_area"][false_alarm]
+            if match["n_true"] and len(alarm_centres):
+                alarm_distances = cKDTree(match["cell_centres"]).query(alarm_centres)[0]
+            else:
+                alarm_distances = np.full(len(alarm_centres), np.inf)
+            for (row, col), area, distance in zip(alarm_centres, alarm_areas, alarm_distances):
+                false_alarm_rows.append(
+                    {
+                        "section": name,
+                        "slide": tr.slide_of(item["image"]),
+                        "annotation": kind,
+                        "row": int(row),
+                        "col": int(col),
+                        "area_px": int(area),
+                        "distance_to_cell_px": round(float(distance), 1),
+                    }
+                )
+
             if kind == "outlines":
                 for key in ("cell_iou", "cell_area", "matched_object_area"):
                     pooled[key].append(match[key])
-                pooled["false_alarm_area"].append(match["object_area"][false_alarm])
+                pooled["false_alarm_area"].append(alarm_areas)
+                pooled["false_alarm_distance"].append(alarm_distances)
 
             for category, new in collect_examples(name, image, truth, predicted, match, verdict, rng).items():
                 examples[category] += new
@@ -440,12 +478,28 @@ def main():
         writer.writerows(rows)
     save_gallery(examples, os.path.join(out_dir, "gallery.pdf"), rng)
 
+    alarm_files = [os.path.join(out_dir, "false_alarms.csv")]
+    if args.split == "train":  # these are the hard negatives for the next training run
+        alarm_files.append(os.path.join(data_dir, tr.HARD_NEGATIVE_FILE))
+    for path in alarm_files:
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=["section", "slide", "annotation", "row", "col", "area_px", "distance_to_cell_px"]
+            )
+            writer.writeheader()
+            writer.writerows(false_alarm_rows)
+
     pooled = {key: np.concatenate(parts) if parts else np.array([]) for key, parts in pooled.items()}
     lines = summarise(rows, pooled, args.split, args.weights)
     with open(os.path.join(out_dir, "summary.txt"), "w") as f:
         f.write("\n".join(lines) + "\n")
     print("\n" + "\n".join(lines))
     print(f"\nresults saved in {out_dir}")
+    if args.split == "train":
+        print(
+            f"{len(false_alarm_rows)} false alarms on the training slides written to {alarm_files[-1]}; "
+            "unet_training_dict.py will use them as hard negatives"
+        )
 
 
 if __name__ == "__main__":
