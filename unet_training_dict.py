@@ -9,6 +9,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Train the U-Net on single-section images. What a run uses depends on SPLIT_MODE (see the settings below):
+
+  SPLIT_MODE = "slide"     (whole slides; cross-validation by slide)
+    python3 unet_training_dict.py --fold 0    # validate on fold 0's slides, train on the other non-test slides
+    python3 unet_training_dict.py --final     # train on every non-test slide (no validation)
+
+  SPLIT_MODE = "section"   (sections drawn at random within each slide)
+    python3 unet_training_dict.py             # train on the training sections, validate on the validation sections
+
+The test slides or sections are never used here. Each run keeps its last-epoch weights in
+<data directory>/models/<run>.pth (fold0 ... fold3, final, or section), next to a <run>.json record of
+what it trained and validated on, which unet_evaluation_dict.py reads. To train the four folds at once,
+one per GPU:
+
+    for k in 0 1 2 3; do CUDA_VISIBLE_DEVICES=$k nohup python3 unet_training_dict.py --fold $k > fold$k.log 2>&1 & done
+"""
+
+import argparse
 import csv
 import json
 import logging
@@ -56,7 +74,7 @@ from monai.visualize import plot_2d_or_3d_image
 DATA_DIR = "/zjbd/zd1/isaac/rabies_cnn"
 IMAGE_FOLDER = "112_02_single_section_raw_input"
 MASK_FOLDER = "112_02_single_section_seg_masks"
-MODEL_FILE = "best_metric_model_segmentation2d_array.pth"   # best weights, saved in the data directory
+MODEL_FOLDER = "models"   # weights of each run (fold0.pth, fold1.pth, ..., final.pth), each with a .json record
 
 RAW_CHANNEL = 0       # which channel of the TIFF to train on
 MASK_KEY = "BW_I2"    # which mask in the .mat goes with that channel
@@ -83,12 +101,29 @@ PATCH_SIZE = (256, 256)
 NUM_SAMPLES = 8       # patches drawn from a section each time it comes up in a batch
 POS, NEG = 3, 1       # POS / (POS + NEG) = share of patches centred on a cell pixel (the rest: tissue background)
 
-# --- data split: whole slides go to train / val / test in this repeating order (5/7, 1/7, 1/7 of the slides) ---
-SPLIT_FILE = "split_by_slide.json"   # written once into the data directory, then reused so the test set never changes
-SPLIT_CYCLE = ("train", "train", "train", "val", "train", "train", "test")
+# --- data split ---
+# "slide":   whole slides. The test slides are fixed in SPLIT_FILE (written once, then reused, so the test set
+#            never changes); the other slides are dealt, in anterior-to-posterior order, over N_FOLDS validation
+#            groups, kept in FOLD_FILE. Train with --fold K or --final.
+# "section": sections drawn at random within every slide: SECTION_SPLIT_SHARES of each slide's sections go to
+#            validation and test, the rest to training, kept in SECTION_SPLIT_FILE. Every set then holds sections
+#            from every slide, including the slide split's test slides. Train without --fold or --final.
+SPLIT_MODE = "section"
+SPLIT_FILE = "split_by_slide.json"
+SPLIT_CYCLE = ("train", "train", "train", "val", "train", "train", "test")   # used only to create SPLIT_FILE
+FOLD_FILE = "cv_folds.json"
+N_FOLDS = 4
+SECTION_SPLIT_FILE = "split_by_section.json"
+SECTION_SPLIT_SHARES = {"val": 0.15, "test": 0.15}
+SECTION_SPLIT_SEED = 0
 
-# --- run length (one epoch = number of training sections / batch_size steps, about 30 with ~120 sections) ---
+# --- run length and learning rate ---
+# One epoch = number of training sections / batch_size steps. The learning rate falls from LEARNING_RATE to
+# MIN_LEARNING_RATE along a cosine over the run, and every run keeps its last-epoch weights: the final model
+# has no validation slides to pick a best epoch with, so the folds are trained the same way.
 NUM_EPOCHS = 100
+LEARNING_RATE = 1e-3
+MIN_LEARNING_RATE = 1e-5
 VAL_INTERVAL = 5      # whole-section validation every this many epochs (patch validation runs every epoch)
 
 # --- output ---
@@ -236,11 +271,11 @@ def slide_of(path):
     return section_key(path).split(".tif_section_")[0]
 
 
-def split_by_slide(images, segs, split_path):
-    """Split the paired sections into train / val / test by slide (about 70 / 15 / 15 %).
+def slide_assignment(images, split_path):
+    """slide -> "train" / "val" / "test", from split_path; the file is created on first use (SPLIT_CYCLE order).
 
-    All sections cut from one slide go to the same set. The assignment is written to split_path
-    the first time and read back on every later run, so the test sections stay the same.
+    All sections cut from one slide go to the same set. The file is read back on every later run, so the
+    test slides stay the same.
     """
     slides = sorted({slide_of(p) for p in images})
     if len(slides) == len(images):
@@ -255,20 +290,173 @@ def split_by_slide(images, segs, split_path):
                 f"slides {unknown} are not listed in {split_path}; delete that file to redo the split "
                 "(note that this changes the test set)"
             )
-        print(f"using the existing split in {split_path}")
     else:
         slide_split = {slide: SPLIT_CYCLE[i % len(SPLIT_CYCLE)] for i, slide in enumerate(slides)}
         with open(split_path, "w") as f:
             json.dump({"note": "slide -> split; delete this file to redo the split", "slides": slide_split}, f, indent=2)
         print(f"new split written to {split_path}")
+    return {slide: slide_split[slide] for slide in slides}
 
+
+def split_by_slide(images, segs, split_path):
+    """train / val / test lists of {"image", "label"} dicts, by the slide split in split_path.
+
+    This is the original single split; training now uses the folds (load_folds) instead.
+    """
+    slide_split = slide_assignment(images, split_path)
     files = {"train": [], "val": [], "test": []}
     for image, seg in zip(images, segs):
         files[slide_split[slide_of(image)]].append({"image": image, "label": seg})
     for name, members in files.items():
-        in_split = [s for s in slides if slide_split[s] == name]
+        in_split = [s for s, part in slide_split.items() if part == name]
         print(f"  {name}: {len(members)} sections from {len(in_split)} slides {in_split}")
     return files
+
+
+def load_folds(images, data_dir):
+    """(test slides, folds): the fixed test slides, and the other slides divided into validation groups.
+
+    The test slides come from SPLIT_FILE. The folds come from FOLD_FILE, created on first use by dealing
+    the other slides, in anterior-to-posterior order, round-robin over N_FOLDS groups, so that every group
+    spans the whole axis. Both files are reused afterwards.
+    """
+    assignment = slide_assignment(images, os.path.join(data_dir, SPLIT_FILE))
+    test_slides = sorted(s for s, part in assignment.items() if part == "test")
+    other_slides = sorted(s for s, part in assignment.items() if part != "test")
+
+    fold_path = os.path.join(data_dir, FOLD_FILE)
+    if os.path.exists(fold_path):
+        with open(fold_path) as f:
+            folds = json.load(f)["folds"]
+        if sorted(s for fold in folds for s in fold) != other_slides:
+            raise ValueError(
+                f"{fold_path} does not list exactly the non-test slides {other_slides}; delete it to redo the folds"
+            )
+    else:
+        folds = [other_slides[k::N_FOLDS] for k in range(N_FOLDS)]
+        with open(fold_path, "w") as f:
+            json.dump(
+                {
+                    "note": "validation groups for cross-validation by slide; delete this file to redo them",
+                    "test": test_slides,
+                    "folds": folds,
+                },
+                f,
+                indent=2,
+            )
+        print(f"cross-validation folds written to {fold_path}")
+    return test_slides, folds
+
+
+def run_slides(images, data_dir, run):
+    """(training, validation, test) slides of a run: "fold0", "fold1", ... or "final"."""
+    test_slides, folds = load_folds(images, data_dir)
+    non_test = sorted(s for fold in folds for s in fold)
+    if run == "final":
+        return non_test, [], test_slides
+    k = int(run.removeprefix("fold"))
+    if not 0 <= k < len(folds):
+        raise SystemExit(f"there are {len(folds)} folds, numbered 0 to {len(folds) - 1}; got --fold {k}")
+    return [s for s in non_test if s not in folds[k]], list(folds[k]), test_slides
+
+
+def files_for_slides(images, segs, slides):
+    """{"image", "label"} dicts for every section on the given slides."""
+    keep = set(slides)
+    return [{"image": image, "label": seg} for image, seg in zip(images, segs) if slide_of(image) in keep]
+
+
+def files_for_sections(images, segs, sections):
+    """{"image", "label"} dicts for the given sections (section names as section_key() gives them)."""
+    keep = set(sections)
+    return [{"image": image, "label": seg} for image, seg in zip(images, segs) if section_key(image) in keep]
+
+
+def split_by_section(images, segs, split_path):
+    """Split the paired sections into train / val / test at random, separately within every slide.
+
+    From each slide, SECTION_SPLIT_SHARES of its sections (rounded) go to validation and test and the rest
+    to training, so every set holds sections from every slide. Sections of one slide share staining,
+    mounting, imaging and here annotation style, so validation and test then measure performance on
+    slides the model has seen. The assignment is written to split_path the first time and read back on
+    every later run, so the test sections stay the same.
+    """
+    keys = [section_key(p) for p in images]
+    if os.path.exists(split_path):
+        with open(split_path) as f:
+            section_split = json.load(f)["sections"]
+        unknown = [k for k in keys if k not in section_split]
+        if unknown:
+            raise ValueError(
+                f"{len(unknown)} sections (e.g. {unknown[0]}) are not listed in {split_path}; delete that file "
+                "to redo the split (note that this changes the test set)"
+            )
+        print(f"using the existing split in {split_path}")
+    else:
+        rng = np.random.default_rng(SECTION_SPLIT_SEED)
+        section_split = {}
+        for slide in sorted({slide_of(p) for p in images}):
+            members = sorted(k for k, p in zip(keys, images) if slide_of(p) == slide)
+            n_val = int(len(members) * SECTION_SPLIT_SHARES["val"] + 0.5)
+            n_test = int(len(members) * SECTION_SPLIT_SHARES["test"] + 0.5)
+            for rank, i in enumerate(rng.permutation(len(members))):
+                section_split[members[i]] = "val" if rank < n_val else "test" if rank < n_val + n_test else "train"
+        with open(split_path, "w") as f:
+            json.dump(
+                {
+                    "note": "section -> split, drawn at random within each slide; delete this file to redo the split",
+                    "seed": SECTION_SPLIT_SEED,
+                    "sections": section_split,
+                },
+                f,
+                indent=2,
+            )
+        print(f"new split written to {split_path}")
+
+    files = {"train": [], "val": [], "test": []}
+    for image, seg, key in zip(images, segs, keys):
+        files[section_split[key]].append({"image": image, "label": seg})
+    for name, members in files.items():
+        slides = sorted({slide_of(item["image"]) for item in members})
+        print(f"  {name}: {len(members)} sections from {len(slides)} slides")
+    return files
+
+
+def run_files(images, segs, data_dir, run):
+    """Training, validation and test sections of a run, and the record of them to save with its weights.
+
+    Runs "fold0", "fold1", ... and "final" use the slide split; run "section" uses the section split.
+    """
+    if run == "section":
+        print(f"run {run}: sections drawn at random within each slide")
+        files = split_by_section(images, segs, os.path.join(data_dir, SECTION_SPLIT_FILE))
+        record = {"split_mode": "section"}
+        for name in ("train", "val", "test"):
+            record[f"{name}_sections"] = sorted(section_key(item["image"]) for item in files[name])
+        return files["train"], files["val"], files["test"], record
+
+    train_slides, val_slides, test_slides = run_slides(images, data_dir, run)
+    print(f"run {run}:")
+    print(f"  training slides ({len(train_slides)}): {', '.join(train_slides)}")
+    print(f"  validation slides ({len(val_slides)}): {', '.join(val_slides) if val_slides else 'none (final model)'}")
+    print(f"  test slides, not used here ({len(test_slides)}): {', '.join(test_slides)}")
+    record = {"split_mode": "slide", "train_slides": train_slides, "val_slides": val_slides, "test_slides": test_slides}
+    return (
+        files_for_slides(images, segs, train_slides),
+        files_for_slides(images, segs, val_slides),
+        files_for_slides(images, segs, test_slides),
+        record,
+    )
+
+
+def model_path(data_dir, run):
+    """Where the weights of a run ("fold0", ..., "final") are kept."""
+    return os.path.join(data_dir, MODEL_FOLDER, f"{run}.pth")
+
+
+def model_info_path(weights_path):
+    """The small JSON file saved next to a weights file, recording how that model was trained."""
+    return os.path.splitext(weights_path)[0] + ".json"
 
 
 def evaluate_patches(model, images, labels, dice_loss, bce_loss, device, batch_size=32):
@@ -296,7 +484,7 @@ def record_epoch(history, **values):
         history.setdefault(name, []).append(float(value))
 
 
-def save_loss_plot(history, plot_dir):
+def save_loss_plot(history, plot_dir, run):
     """Plot loss (left) and Dice (right) against epoch; save as a PDF in plot_dir and return the file path."""
     os.makedirs(plot_dir, exist_ok=True)
     logging.getLogger("fontTools").setLevel(logging.WARNING)  # font embedding is chatty at INFO level
@@ -332,8 +520,8 @@ def save_loss_plot(history, plot_dir):
     ax_dice.grid(alpha=0.3)
     ax_dice.legend(loc="lower right")
 
-    fig.suptitle(f"raw channel {RAW_CHANNEL}, mask {MASK_KEY}")
-    plot_path = os.path.join(plot_dir, f"loss_vs_epochs_{datetime.now():%Y%m%d_%H%M%S}.pdf")
+    fig.suptitle(f"{run}: raw channel {RAW_CHANNEL}, mask {MASK_KEY}")
+    plot_path = os.path.join(plot_dir, f"loss_vs_epochs_{run}_{datetime.now():%Y%m%d_%H%M%S}.pdf")
     fig.savefig(plot_path, transparent=True, bbox_inches="tight")
     plt.close(fig)
     return plot_path
@@ -438,7 +626,7 @@ def build_model():
     )
 
 
-def main(data_dir):
+def main(data_dir, run):
     monai.config.print_config()
     logging.basicConfig(stream=sys.stdout, level=logging.INFO)
     # sections whose mask is empty can only give background patches; MONAI warns about each one, every epoch
@@ -452,13 +640,17 @@ def main(data_dir):
     print(f"first pair: image {first_image.shape}, mask {first_mask.shape}, mask pixels = {int(first_mask.sum())}")
     assert first_image.shape == first_mask.shape, "image and mask shapes differ"
 
-    # one dictionary per section, so the image and its mask travel through the transforms together;
-    # whole slides are assigned to train / val / test, and the assignment is kept in a file
-    files = split_by_slide(images, segs, os.path.join(data_dir, SPLIT_FILE))
-    train_files, val_files = files["train"], files["val"]  # files["test"] is deliberately not touched in this script
+    # the sections this run trains and validates on (one dictionary per section, so the image and its mask
+    # travel through the transforms together); the test sections are never used in this script
+    train_files, val_files, _, record = run_files(images, segs, data_dir, run)
+    has_validation = len(val_files) > 0
     if EXCLUDE_DOT_MASKS:
         train_files = drop_dot_sections(train_files, data_dir, "train")
-        val_files = drop_dot_sections(val_files, data_dir, "val")
+        if val_files:
+            val_files = drop_dot_sections(val_files, data_dir, "val")
+    validate = len(val_files) > 0
+    if has_validation and not validate:
+        print("WARNING: no validation sections are left after leaving out the dot-annotated ones")
 
     # hard negatives: false alarms of an earlier model on these sections, if they have been collected
     hard_negatives = load_hard_negatives(data_dir)
@@ -520,30 +712,31 @@ def main(data_dir):
         persistent_workers=True,  # keep the workers alive between epochs
         drop_last=True,  # no small leftover batch: Dice over the batch needs a decent mix of patches
     )
-    # validation data: whole sections, one at a time
-    val_ds = CacheDataset(val_files, val_transforms, cache_rate=1.0, num_workers=8, progress=False)
-    val_loader = DataLoader(val_ds, batch_size=1, num_workers=2, pin_memory=torch.cuda.is_available())
+    if validate:
+        # validation data: whole sections, one at a time
+        val_ds = CacheDataset(val_files, val_transforms, cache_rate=1.0, num_workers=8, progress=False)
+        val_loader = DataLoader(val_ds, batch_size=1, num_workers=2, pin_memory=torch.cuda.is_available())
 
-    # A fixed set of validation patches, drawn once with exactly the sampling used for training.
-    # Loss and Dice on these are directly comparable with the training numbers; the whole-section
-    # validation further down is a different, much harder measurement.
-    val_sampler = RandCropByPosNegLabeld(
-        keys=["image", "label"],
-        label_key="label",
-        spatial_size=PATCH_SIZE,
-        pos=POS,
-        neg=NEG,
-        num_samples=NUM_SAMPLES,
-        image_key="image",
-        image_threshold=0,
-    )
-    val_sampler.set_random_state(seed=0)
-    val_patches = [patch for i in range(len(val_ds)) for patch in val_sampler(val_ds[i])]
-    # shuffle once so that every batch mixes patches from many sections, as the training batches do
-    order = torch.randperm(len(val_patches), generator=torch.Generator().manual_seed(0)).tolist()
-    val_patch_images = torch.stack([val_patches[i]["image"].as_subclass(torch.Tensor) for i in order])
-    val_patch_labels = torch.stack([val_patches[i]["label"].as_subclass(torch.Tensor) for i in order])
-    print(f"validation patches: {len(val_patch_images)} fixed patches from {len(val_ds)} sections")
+        # A fixed set of validation patches, drawn once with exactly the sampling used for training.
+        # Loss and Dice on these are directly comparable with the training numbers; the whole-section
+        # validation further down is a different, much harder measurement.
+        val_sampler = RandCropByPosNegLabeld(
+            keys=["image", "label"],
+            label_key="label",
+            spatial_size=PATCH_SIZE,
+            pos=POS,
+            neg=NEG,
+            num_samples=NUM_SAMPLES,
+            image_key="image",
+            image_threshold=0,
+        )
+        val_sampler.set_random_state(seed=0)
+        val_patches = [patch for i in range(len(val_ds)) for patch in val_sampler(val_ds[i])]
+        # shuffle once so that every batch mixes patches from many sections, as the training batches do
+        order = torch.randperm(len(val_patches), generator=torch.Generator().manual_seed(0)).tolist()
+        val_patch_images = torch.stack([val_patches[i]["image"].as_subclass(torch.Tensor) for i in order])
+        val_patch_labels = torch.stack([val_patches[i]["label"].as_subclass(torch.Tensor) for i in order])
+        print(f"validation patches: {len(val_patch_images)} fixed patches from {len(val_ds)} sections")
 
     # sampling check: how many training patches actually contain a cell?
     sections_with_cells = sum(bool(load_mask(f["label"]).any()) for f in train_files)
@@ -591,16 +784,15 @@ def main(data_dir):
     dice_loss = monai.losses.DiceLoss(sigmoid=True, batch=True)
     bce_loss = torch.nn.BCEWithLogitsLoss()
 
-    optimizer = torch.optim.Adam(model.parameters(), 1e-3)
+    optimizer = torch.optim.Adam(model.parameters(), LEARNING_RATE)
+    # cosine decay from LEARNING_RATE to MIN_LEARNING_RATE over the run, one step per epoch
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=MIN_LEARNING_RATE)
 
-    # start a typical PyTorch training
-    val_interval = VAL_INTERVAL
-    best_metric = -1
-    best_metric_epoch = -1
-    history = {}  # per-epoch training losses, filled by record_epoch()
-    metric_values = list()
-    writer = SummaryWriter()
+    history = {}       # per-epoch numbers, filled by record_epoch()
+    section_dice = []  # (epoch, mean whole-section validation Dice)
+    writer = SummaryWriter(comment=f"_{run}")
     for epoch in range(NUM_EPOCHS):
+        learning_rate = optimizer.param_groups[0]["lr"]
         model.train()
         epoch_loss = epoch_dice_term = epoch_bce_term = 0.0
         true_positive = predicted_pixels = cell_pixels = 0
@@ -633,58 +825,86 @@ def main(data_dir):
         epoch_loss /= step
         # Dice of the thresholded predictions on this epoch's training patches
         train_dice = 2 * true_positive / max(predicted_pixels + cell_pixels, 1)
-        # the same two numbers on the fixed validation patches
-        val_loss, val_patch_dice = evaluate_patches(model, val_patch_images, val_patch_labels, dice_loss, bce_loss, device)
-        record_epoch(history, loss=epoch_loss, val_loss=val_loss, train_patch_dice=train_dice, val_patch_dice=val_patch_dice)
-        writer.add_scalar("val_patch_loss", val_loss, epoch + 1)
-        writer.add_scalar("val_patch_dice", val_patch_dice, epoch + 1)
-        print(
-            f"epoch {epoch + 1}/{NUM_EPOCHS}: train loss {epoch_loss:.4f} (dice {epoch_dice_term / step:.4f} + bce {epoch_bce_term / step:.4f}),"
-            f" patch dice {train_dice:.4f} | val loss {val_loss:.4f}, patch dice {val_patch_dice:.4f}"
+        line = (
+            f"epoch {epoch + 1}/{NUM_EPOCHS} (lr {learning_rate:.1e}): train loss {epoch_loss:.4f} "
+            f"(dice {epoch_dice_term / step:.4f} + bce {epoch_bce_term / step:.4f}), patch dice {train_dice:.4f}"
         )
+        if validate:
+            # the same two numbers on the fixed validation patches
+            val_loss, val_patch_dice = evaluate_patches(model, val_patch_images, val_patch_labels, dice_loss, bce_loss, device)
+            record_epoch(history, loss=epoch_loss, val_loss=val_loss, train_patch_dice=train_dice, val_patch_dice=val_patch_dice)
+            writer.add_scalar("val_patch_loss", val_loss, epoch + 1)
+            writer.add_scalar("val_patch_dice", val_patch_dice, epoch + 1)
+            line += f" | val loss {val_loss:.4f}, patch dice {val_patch_dice:.4f}"
+        else:
+            record_epoch(history, loss=epoch_loss, train_patch_dice=train_dice)
+        print(line)
+        scheduler.step()
 
-        if (epoch + 1) % val_interval == 0:
+        if validate and ((epoch + 1) % VAL_INTERVAL == 0 or epoch + 1 == NUM_EPOCHS):
             model.eval()
             with torch.no_grad():
-                val_images = None
-                val_labels = None
-                val_outputs = None
                 for val_data in val_loader:
                     val_images, val_labels = val_data["image"].to(device), val_data["label"].to(device)
-                    roi_size = PATCH_SIZE
-                    sw_batch_size = 4
-                    val_outputs = sliding_window_inference(val_images, roi_size, sw_batch_size, model)
+                    val_outputs = sliding_window_inference(val_images, PATCH_SIZE, 4, model)
                     val_outputs = [post_trans(i) for i in decollate_batch(val_outputs)]
-                    # compute metric for current iteration
                     dice_metric(y_pred=val_outputs, y=val_labels)
-                # aggregate the final mean dice result
                 metric = dice_metric.aggregate().item()
-                # reset the status for next validation round
                 dice_metric.reset()
-                metric_values.append(metric)
-                record_epoch(history, section_dice_epoch=epoch + 1, section_dice=metric)
-                if metric > best_metric:
-                    best_metric = metric
-                    best_metric_epoch = epoch + 1
-                    torch.save(model.state_dict(), os.path.join(data_dir, MODEL_FILE))
-                    print("saved new best metric model")
-                print(
-                    "  whole-section validation at epoch {}: mean dice {:.4f} (best {:.4f} at epoch {})".format(
-                        epoch + 1, metric, best_metric, best_metric_epoch
-                    )
-                )
-                writer.add_scalar("val_mean_dice", metric, epoch + 1)
-                # plot the last model output as GIF image in TensorBoard with the corresponding image and label
-                plot_2d_or_3d_image(val_images, epoch + 1, writer, index=0, tag="image")
-                plot_2d_or_3d_image(val_labels, epoch + 1, writer, index=0, tag="label")
-                plot_2d_or_3d_image(val_outputs, epoch + 1, writer, index=0, tag="output")
-
-    print(f"train completed, best_metric: {best_metric:.4f} at epoch: {best_metric_epoch}")
+            section_dice.append((epoch + 1, metric))
+            record_epoch(history, section_dice_epoch=epoch + 1, section_dice=metric)
+            print(f"  whole-section validation at epoch {epoch + 1}: mean dice {metric:.4f}")
+            writer.add_scalar("val_mean_dice", metric, epoch + 1)
+            # the last validation section's image, label and output, for TensorBoard
+            plot_2d_or_3d_image(val_images, epoch + 1, writer, index=0, tag="image")
+            plot_2d_or_3d_image(val_labels, epoch + 1, writer, index=0, tag="label")
+            plot_2d_or_3d_image(val_outputs, epoch + 1, writer, index=0, tag="output")
     writer.close()
 
-    plot_path = save_loss_plot(history, os.path.join(data_dir, PLOT_FOLDER))
+    # keep the last-epoch weights, with a record of the slides this run trained and validated on
+    weights_path = model_path(data_dir, run)
+    os.makedirs(os.path.dirname(weights_path), exist_ok=True)
+    torch.save(model.state_dict(), weights_path)
+    with open(model_info_path(weights_path), "w") as f:
+        json.dump(
+            {
+                "run": run,
+                **record,
+                "epochs": NUM_EPOCHS,
+                "exclude_dot_masks": EXCLUDE_DOT_MASKS,
+                "hard_negative_share": HARD_NEGATIVE_SHARE if hard_negatives is not None else 0,
+                "whole_section_val_dice": {str(e): round(float(m), 4) for e, m in section_dice},
+                "saved": f"{datetime.now():%Y-%m-%d %H:%M}",
+            },
+            f,
+            indent=2,
+        )
+    print(f"training finished; last-epoch weights saved to {weights_path}")
+    if section_dice:
+        best_epoch, best = max(section_dice, key=lambda pair: pair[1])
+        print(
+            f"whole-section validation dice at the end: {section_dice[-1][1]:.4f} "
+            f"(highest during the run: {best:.4f}, at epoch {best_epoch})"
+        )
+
+    plot_path = save_loss_plot(history, os.path.join(data_dir, PLOT_FOLDER), run)
     print(f"loss plot saved to {plot_path}")
 
 
 if __name__ == "__main__":
-    main(DATA_DIR)
+    parser = argparse.ArgumentParser(description="Train the U-Net (see SPLIT_MODE at the top of this file).")
+    which = parser.add_mutually_exclusive_group()
+    which.add_argument("--fold", type=int, help='SPLIT_MODE "slide": validate on this fold\'s slides, train on the other non-test slides')
+    which.add_argument("--final", action="store_true", help='SPLIT_MODE "slide": train on every non-test slide, without validation')
+    args = parser.parse_args()
+    if SPLIT_MODE == "section":
+        if args.fold is not None or args.final:
+            parser.error('SPLIT_MODE is "section": run without --fold or --final (those belong to SPLIT_MODE "slide")')
+        run = "section"
+    elif SPLIT_MODE == "slide":
+        if args.fold is None and not args.final:
+            parser.error('SPLIT_MODE is "slide": choose --fold K (0 to N_FOLDS - 1) or --final')
+        run = "final" if args.final else f"fold{args.fold}"
+    else:
+        parser.error(f'SPLIT_MODE must be "slide" or "section", not {SPLIT_MODE!r}')
+    main(DATA_DIR, run)
