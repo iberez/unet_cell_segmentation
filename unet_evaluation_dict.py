@@ -15,19 +15,25 @@ patch size, the slides) is imported from unet_training_dict.py, which must sit n
 
 The masks come in two kinds, and each section is scored according to its kind:
     outlines   every cell is drawn as a shape      -> pixel Dice, and cells matched by overlap (IoU)
-    dots       every cell is a small fixed marker  -> a cell is found if a predicted object touches the
-                                                      marker; Dice and outlines mean nothing
+    dots       every cell is a small fixed marker  -> a marker is matched if a predicted object touches
+                                                      it; Dice and outlines mean nothing
+
+Counts are per cell, not per pixel: a true positive (TP) is an annotated cell matched by a predicted object,
+a false negative (FN) an annotated cell with no match, and a false positive (FP) a predicted object that
+matches no annotated cell. Recall = TP / annotated cells; precision = matched predicted objects / all
+predicted objects.
 
 Results go to <data directory>/evaluation/<cv or split>_<date>_<time>/ :
     summary.txt            the numbers printed at the end
     sections.csv           the same counts, one row per section
-    false_alarms.csv       every false alarm: where it is, how big, how far from the nearest annotated cell
-    gallery.pdf            close-ups of missed cells, false alarms, and found cells
-    sections_overview.pdf  one page per section showing where the hits, misses and false alarms are
+    false_positives.csv    every false positive: where it is, how big, how far from the nearest annotated cell
+    gallery.pdf            close-ups of false negatives, false positives and true positives
+    sections_overview.pdf  one page per section showing where the true positives, false negatives and
+                           false positives are
     predicted_masks/       the predicted mask of every section as a PNG (0 = background, 255 = cell)
 
 Run on the training slides (--split train), it also writes hard_negatives.csv into the data directory:
-the false alarms of the current model on the sections it was trained on. unet_training_dict.py reads
+the false positives of the current model on the sections it was trained on. unet_training_dict.py reads
 that file and draws extra background patches at those places.
 """
 
@@ -59,19 +65,25 @@ EDGE_MARGIN = 8
 
 # Predicted objects smaller than this many pixels are discarded before scoring (0 = keep all). The summary
 # prints a table of what larger values would do, so choose it from a validation run. 20 px was chosen from
-# the validation run of 8 October: it removed half of the false alarms and 5 of 1210 found cells.
+# the validation run of 8 October: it removed half of the false positives and 5 of 1210 true positives.
 MIN_OBJECT_AREA = 20
 
-# A false alarm closer than this to an annotated cell (centre to centre) is counted as "near a cell".
+# A false positive closer than this to an annotated cell (centre to centre) is counted as "near a cell".
 NEAR_CELL_DISTANCE = 40
 
 # Outlined cells: an annotated cell and a predicted object are compared by IoU = overlap / union.
-FOUND_IOU = 0.1       # the cell counts as "found" from this IoU up ...
-CLOSE_IOU = 0.5       # ... and as "found with a closely matching outline" from this IoU up
+FOUND_IOU = 0.1       # an annotated cell counts as a true positive from this IoU up ...
+CLOSE_IOU = 0.5       # ... and as a true positive with a closely matching outline from this IoU up
 
 CROP = 128            # side of the gallery close-ups, in pixels
 EXAMPLES_PER_ROW = 12
-CATEGORIES = ["missed", "false alarm", "found, outline differs", "found, outline matches", "found (dot marker)"]
+CATEGORIES = [
+    "false negative",
+    "false positive",
+    "true positive, outline differs",
+    "true positive, outline matches",
+    "true positive (dot marker)",
+]
 STRUCTURE = np.ones((3, 3), dtype=bool)  # pixels touching at a corner belong to the same object
 
 
@@ -184,14 +196,14 @@ def collect_examples(name, image, truth, predicted, match, verdict, rng, per_cat
     tag = " [dots]" if verdict["kind"] == "dots" else ""
     with_iou = lambda keep: [(c, f"IoU {i:.2f}") for c, i in zip(match["cell_centres"][keep], match["cell_iou"][keep])]
     candidates = {
-        "missed": [(c, "") for c in match["cell_centres"][~found]],
-        "false alarm": [(c, "") for c in match["object_centres"][false_alarm]],
+        "false negative": [(c, "") for c in match["cell_centres"][~found]],
+        "false positive": [(c, "") for c in match["object_centres"][false_alarm]],
     }
     if verdict["kind"] == "dots":
-        candidates["found (dot marker)"] = [(c, "") for c in match["cell_centres"][found]]
+        candidates["true positive (dot marker)"] = [(c, "") for c in match["cell_centres"][found]]
     else:
-        candidates["found, outline differs"] = with_iou(found & ~close)
-        candidates["found, outline matches"] = with_iou(close)
+        candidates["true positive, outline differs"] = with_iou(found & ~close)
+        candidates["true positive, outline matches"] = with_iou(close)
 
     examples = {category: [] for category in CATEGORIES}
     for category, items in candidates.items():
@@ -223,7 +235,8 @@ def save_gallery(examples, path, rng):
             ax.set_xticks([])
             ax.set_yticks([])
             if col == 0:
-                ax.set_ylabel(f"{category}\n({len(examples[category])} collected)", fontsize=9)
+                row_label = category.replace(", ", ",\n").replace(" (", "\n(")  # two short lines instead of one long one
+                ax.set_ylabel(f"{row_label}\n({len(examples[category])} collected)", fontsize=9)
             if col >= len(chosen):
                 ax.set_frame_on(False)
                 continue
@@ -251,12 +264,12 @@ def add_overview_page(pdf, name, image, match, verdict, dice, model_name):
     fig, ax = plt.subplots(figsize=(9, 9))
     ax.imshow(image[::step, ::step], cmap="gray", vmin=0, vmax=max(np.percentile(image, 99.9), 1e-6))
     for centres, style, label in [
-        (match["cell_centres"][found], {"marker": "o", "color": "lime", "s": 14}, "found"),
-        (match["cell_centres"][~found], {"marker": "x", "color": "red", "s": 40}, "missed"),
+        (match["cell_centres"][found], {"marker": "o", "color": "lime", "s": 14}, "true positive"),
+        (match["cell_centres"][~found], {"marker": "x", "color": "red", "s": 40}, "false negative"),
         (
             match["object_centres"][verdict["false_alarm"]],
             {"marker": "s", "facecolors": "none", "edgecolors": "magenta", "s": 40},
-            "false alarm",
+            "false positive",
         ),
     ]:
         ax.scatter(centres[:, 1] / step, centres[:, 0] / step, label=f"{label} ({len(centres)})", linewidths=1.2, **style)
@@ -275,16 +288,21 @@ def share(part, whole):
 
 def per_group_lines(rows, key, title):
     """A small table with one line per model (key="model") or per slide (key="slide")."""
-    lines = ["", title, f"  {key:<7} {'sections':>15}  {'cells':>6}  {'found':>7}  {'false alarms':>12}  {'Dice':>5}"]
+    lines = [
+        "",
+        title,
+        f"  {key:<7} {'sections':>15}  {'cells':>6}  {'TP':>5}  {'FN':>5}  {'FP':>5}  {'recall':>7}  {'precision':>9}  {'Dice':>5}",
+    ]
     for value in sorted({row[key] for row in rows}):
         group = [row for row in rows if row[key] == value]
-        cells, found = sum(row["cells"] for row in group), sum(row["found"] for row in group)
+        cells, objects = sum(row["cells"] for row in group), sum(row["objects"] for row in group)
+        tp, fn, fp = (sum(row[k] for row in group) for k in ("true_positives", "false_negatives", "false_positives"))
         n_dots = sum(row["annotation"] == "dots" for row in group)
         dice = [row["dice"] for row in group if row["annotation"] == "outlines"]
         sections = f"{len(group)}" + (f" ({n_dots} dots)" if n_dots else "")
         lines.append(
-            f"  {value:<7} {sections:>15}  {cells:>6}  {share(found, cells):>7}  "
-            f"{sum(row['false_alarms'] for row in group):>12}  " + (f"{np.mean(dice):>5.2f}" if dice else f"{'-':>5}")
+            f"  {value:<7} {sections:>15}  {cells:>6}  {tp:>5}  {fn:>5}  {fp:>5}  {share(tp, cells):>7}  "
+            f"{share(objects - fp, objects):>9}  " + (f"{np.mean(dice):>5.2f}" if dice else f"{'-':>5}")
         )
     return lines
 
@@ -318,25 +336,26 @@ def summarise(rows, pooled, split, weights_path):
 
     group = by_kind["outlines"]
     if group:
-        cells, objects, found = total(group, "cells"), total(group, "objects"), total(group, "found")
-        false_alarms_n = total(group, "false_alarms")
+        cells, objects, found = total(group, "cells"), total(group, "objects"), total(group, "true_positives")
+        false_alarms_n = total(group, "false_positives")
+        close = total(group, "true_positives_close_outline")
         overlap, both_sizes = total(group, "overlap_pixels"), total(group, "true_pixels") + total(group, "predicted_pixels")
         found_iou = pooled["cell_iou"][pooled["cell_iou"] >= FOUND_IOU]
         lines += [
             "",
-            f"SECTIONS WITH OUTLINED CELLS ({len(group)})",
+            f"SECTIONS WITH OUTLINED CELLS ({len(group)})   (TP: an annotated cell matched by a predicted object, IoU >= {FOUND_IOU})",
             f"  pixels: mean Dice per section {np.mean([row['dice'] for row in group]):.4f}, "
             f"Dice over all their pixels pooled {2 * overlap / max(both_sizes, 1):.4f}",
             f"  annotated cells: {cells}    predicted objects: {objects}",
-            f"  found (IoU >= {FOUND_IOU}):  {found}  ({share(found, cells)} of annotated cells)",
-            f"    of these, outline closely matching (IoU >= {CLOSE_IOU}): {total(group, 'close')}  "
-            f"({share(total(group, 'close'), cells)} of annotated cells)",
-            f"  missed:        {cells - found}  ({share(cells - found, cells)} of annotated cells)",
-            f"  false alarms:  {total(group, 'false_alarms')}  ({share(total(group, 'false_alarms'), objects)} of predicted objects)",
+            f"  true positives (TP):   {found}  (recall {share(found, cells)})",
+            f"    of these, outline closely matching (IoU >= {CLOSE_IOU}): {close}  ({share(close, cells)} of annotated cells)",
+            f"  false negatives (FN):  {cells - found}  ({share(cells - found, cells)} of annotated cells)",
+            f"  false positives (FP):  {false_alarms_n}  ({share(false_alarms_n, objects)} of predicted objects; "
+            f"precision {share(objects - false_alarms_n, objects)})",
         ]
         if len(found_iou):
             lines.append(
-                f"  outlines of the found cells: mean IoU {found_iou.mean():.2f} (a Dice of "
+                f"  outlines of the true positives: mean IoU {found_iou.mean():.2f} (a Dice of "
                 f"{np.mean(2 * found_iou / (1 + found_iou)):.2f} per cell); median area annotated "
                 f"{np.median(pooled['cell_area'][pooled['cell_iou'] >= FOUND_IOU]):.0f} px, predicted "
                 f"{np.median(pooled['matched_object_area'][pooled['cell_iou'] >= FOUND_IOU]):.0f} px"
@@ -344,15 +363,15 @@ def summarise(rows, pooled, split, weights_path):
         if len(pooled["false_alarm_area"]):
             near = int((pooled["false_alarm_distance"] < NEAR_CELL_DISTANCE).sum())
             lines.append(
-                f"  median area of a false alarm: {np.median(pooled['false_alarm_area']):.0f} px; "
+                f"  median area of a false positive: {np.median(pooled['false_alarm_area']):.0f} px; "
                 f"{near} of them lie within {NEAR_CELL_DISTANCE} px of an annotated cell, {false_alarms_n - near} farther away"
             )
         # what a (larger) minimum object area would do, judged from the sizes of today's objects
         found_object_area = pooled["matched_object_area"][pooled["cell_iou"] >= FOUND_IOU]
-        false_alarms = total(group, "false_alarms")
+        false_alarms = false_alarms_n
         lines += [
             f"  what a larger minimum object area would do (objects under {MIN_OBJECT_AREA} px are already gone):",
-            "      minimum area    false alarms left    found cells kept",
+            "      minimum area     FP left           TP kept",
         ]
         for area in (0, 10, 20, 30, 40, 50, 75, 100):
             left, kept = int((pooled["false_alarm_area"] >= area).sum()), int((found_object_area >= area).sum())
@@ -362,24 +381,24 @@ def summarise(rows, pooled, split, weights_path):
 
     group = by_kind["dots"]
     if group:
-        cells, objects, found = total(group, "cells"), total(group, "objects"), total(group, "found")
+        cells, objects, found = total(group, "cells"), total(group, "objects"), total(group, "true_positives")
+        fp = total(group, "false_positives")
         lines += [
             "",
-            f"SECTIONS WITH DOT MARKERS ({len(group)})   (found = a predicted object touches the marker)",
+            f"SECTIONS WITH DOT MARKERS ({len(group)})   (TP: a marker touched by a predicted object; FP: an object touching no marker)",
             f"  annotated cells: {cells}    predicted objects: {objects}",
-            f"  found:         {found}  ({share(found, cells)} of annotated cells)",
-            f"  missed:        {cells - found}  ({share(cells - found, cells)} of annotated cells)",
-            f"  false alarms:  {total(group, 'false_alarms')}  ({share(total(group, 'false_alarms'), objects)} of predicted "
-            "objects; these touch no marker)",
+            f"  true positives (TP):   {found}  (recall {share(found, cells)})",
+            f"  false negatives (FN):  {cells - found}  ({share(cells - found, cells)} of annotated cells)",
+            f"  false positives (FP):  {fp}  ({share(fp, objects)} of predicted objects; precision {share(objects - fp, objects)})",
             f"  merged:        {total(group, 'merged_objects')} predicted objects touch more than one marker "
             f"({total(group, 'cells_in_merged_objects')} markers in all)",
         ]
 
     group = by_kind["empty"]
     if group:
-        lines += ["", f"SECTIONS WITH AN EMPTY MASK ({len(group)}): {total(group, 'objects')} predicted objects, all false alarms"]
+        lines += ["", f"SECTIONS WITH AN EMPTY MASK ({len(group)}): {total(group, 'objects')} predicted objects, all false positives"]
 
-    # how the models and the slides compare ("found" counts outlined cells by overlap and dot markers by touch)
+    # how the models and the slides compare (TP counts outlined cells by overlap and dot markers by touch)
     models = sorted({row["model"] for row in rows})
     if len(models) > 1:
         lines += per_group_lines(rows, "model", "PER MODEL (each on its own validation slides; Dice: mean over outlined sections)")
@@ -519,10 +538,10 @@ def main():
                         "annotation": kind,
                         "cells": match["n_true"],
                         "objects": match["n_pred"],
-                        "found": int(found.sum()),
-                        "close": int(close.sum()),
-                        "missed": int((~found).sum()),
-                        "false_alarms": int(false_alarm.sum()),
+                        "true_positives": int(found.sum()),
+                        "true_positives_close_outline": int(close.sum()),
+                        "false_negatives": int((~found).sum()),
+                        "false_positives": int(false_alarm.sum()),
                         "dice": dice,
                         "true_pixels": true_pixels,
                         "predicted_pixels": predicted_pixels,
@@ -567,8 +586,9 @@ def main():
                 add_overview_page(overview, name, image, match, verdict, dice, model_name)
                 Image.fromarray(predicted.astype(np.uint8) * 255).save(os.path.join(out_dir, "predicted_masks", f"{name}.png"))
                 print(
-                    f"  {number}/{n_sections} {name} [{kind}, {model_name}]: {match['n_true']} cells, {rows[-1]['found']} found, "
-                    f"{rows[-1]['missed']} missed, {rows[-1]['false_alarms']} false alarms, {edge_removed} edge objects discarded"
+                    f"  {number}/{n_sections} {name} [{kind}, {model_name}]: {match['n_true']} cells: "
+                    f"TP {rows[-1]['true_positives']}, FN {rows[-1]['false_negatives']}, FP {rows[-1]['false_positives']}; "
+                    f"{edge_removed} edge objects discarded"
                 )
 
     with open(os.path.join(out_dir, "sections.csv"), "w", newline="") as f:
@@ -577,7 +597,7 @@ def main():
         writer.writerows(rows)
     save_gallery(examples, os.path.join(out_dir, "gallery.pdf"), rng)
 
-    alarm_files = [os.path.join(out_dir, "false_alarms.csv")]
+    alarm_files = [os.path.join(out_dir, "false_positives.csv")]
     # false alarms on a slide-split model's own training slides are the hard negatives for the next training
     # run; a section-split model trained on parts of every slide, so its false alarms are kept out of that file
     write_hard_negatives = args.split == "train" and mode == "slide"
@@ -599,7 +619,7 @@ def main():
     print(f"\nresults saved in {out_dir}")
     if write_hard_negatives:
         print(
-            f"{len(false_alarm_rows)} false alarms on the training slides written to {alarm_files[-1]}; "
+            f"{len(false_alarm_rows)} false positives on the training slides written to {alarm_files[-1]}; "
             "unet_training_dict.py will use them as hard negatives"
         )
     elif args.split == "train":
