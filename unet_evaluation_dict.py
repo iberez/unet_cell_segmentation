@@ -4,8 +4,9 @@
     python3 unet_evaluation_dict.py --split val    # one model on its own validation set
     python3 unet_evaluation_dict.py --split test   # one model on its own test set: once, at the very end
     python3 unet_evaluation_dict.py --split train  # one model on its own training set (slide split: writes hard negatives)
+    python3 unet_evaluation_dict.py --all --images DIR --masks DIR   # one model on every section of a new brain
 
---weights picks the model for --split. By default that is models/final.pth when SPLIT_MODE in
+--weights picks the model for --split and --all. By default that is models/final.pth when SPLIT_MODE in
 unet_training_dict.py is "slide", and models/section.pth when it is "section". Which sections a model
 trained, validated and is tested on is read from the .json record saved next to its weights; weights
 without one were trained on the original slide split in split_by_slide.json.
@@ -42,6 +43,7 @@ import csv
 import json
 import os
 from datetime import datetime
+from glob import glob
 
 import numpy as np
 import torch
@@ -443,22 +445,47 @@ def sets_of_model(weights_path, images, segs, data_dir):
     return {name: tr.files_for_slides(images, segs, slides[name]) for name in slides}, "slide"
 
 
+def pairs_in_folders(image_folder, mask_folder):
+    """Image/mask pairs from two folders (a new brain), matched by name and size-checked exactly as in training."""
+    for folder in (image_folder, mask_folder):
+        if not os.path.isdir(folder):
+            raise SystemExit(f"{folder} is not a folder")
+    images = sorted(glob(os.path.join(image_folder, "*.tiff")))
+    segs = sorted(glob(os.path.join(mask_folder, "*.mat")))
+    print(f"len images: {len(images)}")
+    print(f"len segs: {len(segs)}")
+    images, segs = tr.pair_by_name(images, segs)
+    return tr.check_pair_shapes(images, segs)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate trained U-Nets on sections they were not trained on.")
     which = parser.add_mutually_exclusive_group(required=True)
     which.add_argument("--cv", action="store_true", help="every fold model on its own validation slides")
     which.add_argument("--split", choices=["val", "test", "train"], help="one model (--weights) on these slides of its own")
+    which.add_argument("--all", action="store_true", help="one model (--weights) on every section in --images / --masks")
+    parser.add_argument("--images", help="with --all: the folder of section images (.tiff), e.g. of a new brain")
+    parser.add_argument("--masks", help="with --all: the folder of their masks (.mat)")
     parser.add_argument(
         "--weights",
-        help=f"weights for --split (default: {tr.MODEL_FOLDER}/final.pth, or {tr.MODEL_FOLDER}/section.pth when SPLIT_MODE is section)",
+        help=f"weights for --split and --all (default: {tr.MODEL_FOLDER}/final.pth in the data directory, "
+        f"or {tr.MODEL_FOLDER}/section.pth when SPLIT_MODE is section)",
     )
     args = parser.parse_args()
     if args.cv and args.weights:
-        parser.error("--weights goes with --split; --cv always uses the fold models")
+        parser.error("--weights goes with --split or --all; --cv always uses the fold models")
+    if args.all and not (args.images and args.masks):
+        parser.error("--all needs --images and --masks")
+    if (args.images or args.masks) and not args.all:
+        parser.error("--images and --masks go with --all")
 
-    data_dir = tr.DATA_DIR
-    # the same pairing and size check as in training
-    images, segs = tr.list_pairs(data_dir)
+    data_dir = tr.DATA_DIR  # where the trained models are
+    if args.all:
+        # a new brain: every image/mask pair in the two folders given
+        images, segs = pairs_in_folders(args.images, args.masks)
+    else:
+        # the same pairing and size check as in training
+        images, segs = tr.list_pairs(data_dir)
 
     # (model name, weights, sections to evaluate with those weights)
     jobs, mode = [], "slide"
@@ -477,19 +504,27 @@ def main():
         if not os.path.exists(weights):
             how = "python3 unet_training_dict.py" + ("" if default_run == "section" else " --final")
             raise SystemExit(f"{weights} not found: train it first ({how})")
-        sets, mode = sets_of_model(weights, images, segs, data_dir)
-        files = sets[args.split]
-        if not files:
-            raise SystemExit(f"{weights} has no {args.split} sections (the final model trains on every non-test slide)")
-        if args.split == "test":
-            print("NOTE: this evaluates the TEST set. Do it once, at the end.")
         model_name = os.path.splitext(os.path.basename(weights))[0]
+        if args.all:
+            # every section counts: none of them was seen in training
+            files = [{"image": image, "label": seg} for image, seg in zip(images, segs)]
+            label = f"all sections in {os.path.abspath(args.images)}"
+        else:
+            sets, mode = sets_of_model(weights, images, segs, data_dir)
+            files = sets[args.split]
+            if not files:
+                raise SystemExit(f"{weights} has no {args.split} sections (the final model trains on every non-test slide)")
+            if args.split == "test":
+                print("NOTE: this evaluates the TEST set. Do it once, at the end.")
+            label = f"{args.split} set of the {mode} split"
         jobs.append((model_name, weights, files))
-        label, weights_label = f"{args.split} set of the {mode} split", weights
+        weights_label = weights
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    run_label = "cv" if args.cv else f"{args.split}_{model_name}"
-    out_dir = os.path.join(data_dir, "evaluation", f"{run_label}_{datetime.now():%Y%m%d_%H%M%S}")
+    run_label = "cv" if args.cv else f"{'all' if args.all else args.split}_{model_name}"
+    # results of a new brain go next to its image folder; everything else into the data directory
+    results_root = os.path.dirname(os.path.abspath(args.images)) if args.all else data_dir
+    out_dir = os.path.join(results_root, "evaluation", f"{run_label}_{datetime.now():%Y%m%d_%H%M%S}")
     os.makedirs(os.path.join(out_dir, "predicted_masks"))
     rng = np.random.default_rng(0)
     examples = {category: [] for category in CATEGORIES}
