@@ -27,6 +27,7 @@ predicted objects.
 Results go to <data directory>/evaluation/<cv or split>_<date>_<time>/ :
     summary.txt            the numbers printed at the end
     sections.csv           the same counts, one row per section
+    slide_stats.csv        the same counts, one row per slide (the PER SLIDE table of the summary)
     false_positives.csv    every false positive: where it is, how big, how far from the nearest annotated cell
     gallery.pdf            close-ups of false negatives, false positives and true positives
     sections_overview.pdf  one page per section showing where the true positives, false negatives and
@@ -266,8 +267,16 @@ def add_overview_page(pdf, name, image, match, verdict, dice, model_name):
     fig, ax = plt.subplots(figsize=(9, 9))
     ax.imshow(image[::step, ::step], cmap="gray", vmin=0, vmax=max(np.percentile(image, 99.9), 1e-6))
     for centres, style, label in [
-        (match["cell_centres"][found], {"marker": "o", "color": "lime", "s": 14}, "true positive"),
-        (match["cell_centres"][~found], {"marker": "x", "color": "red", "s": 40}, "false negative"),
+        (
+            match["cell_centres"][found],
+            {"marker": "s", "facecolors": "none", "edgecolors": "lime", "s": 40},
+            "true positive",
+        ),
+        (
+            match["cell_centres"][~found],
+            {"marker": "s", "facecolors": "none", "edgecolors": "red", "s": 40},
+            "false negative",
+        ),
         (
             match["object_centres"][verdict["false_alarm"]],
             {"marker": "s", "facecolors": "none", "edgecolors": "magenta", "s": 40},
@@ -288,6 +297,37 @@ def share(part, whole):
     return f"{100 * part / whole:.1f}%" if whole else "n/a"
 
 
+def group_stats(rows, key):
+    """Totals per slide (key="slide") or per model (key="model"), as one dict per group, in name order.
+
+    recall = TP / cells; precision = share of predicted objects that match a cell; dice = mean pixel Dice
+    over the group's outlined sections. A value that can't be computed is None.
+    """
+    stats = []
+    for value in sorted({row[key] for row in rows}):
+        group = [row for row in rows if row[key] == value]
+        cells, objects = sum(row["cells"] for row in group), sum(row["objects"] for row in group)
+        tp, fn, fp = (sum(row[k] for row in group) for k in ("true_positives", "false_negatives", "false_positives"))
+        dice = [row["dice"] for row in group if row["annotation"] == "outlines"]
+        stats.append(
+            {
+                key: value,
+                "model": "/".join(sorted({row["model"] for row in group})),
+                "sections": len(group),
+                "dot_sections": sum(row["annotation"] == "dots" for row in group),
+                "cells": cells,
+                "objects": objects,
+                "true_positives": tp,
+                "false_negatives": fn,
+                "false_positives": fp,
+                "recall": tp / cells if cells else None,
+                "precision": (objects - fp) / objects if objects else None,
+                "dice": float(np.mean(dice)) if dice else None,
+            }
+        )
+    return stats
+
+
 def per_group_lines(rows, key, title):
     """A small table with one line per model (key="model") or per slide (key="slide")."""
     lines = [
@@ -295,18 +335,26 @@ def per_group_lines(rows, key, title):
         title,
         f"  {key:<7} {'sections':>15}  {'cells':>6}  {'TP':>5}  {'FN':>5}  {'FP':>5}  {'recall':>7}  {'precision':>9}  {'Dice':>5}",
     ]
-    for value in sorted({row[key] for row in rows}):
-        group = [row for row in rows if row[key] == value]
-        cells, objects = sum(row["cells"] for row in group), sum(row["objects"] for row in group)
-        tp, fn, fp = (sum(row[k] for row in group) for k in ("true_positives", "false_negatives", "false_positives"))
-        n_dots = sum(row["annotation"] == "dots" for row in group)
-        dice = [row["dice"] for row in group if row["annotation"] == "outlines"]
-        sections = f"{len(group)}" + (f" ({n_dots} dots)" if n_dots else "")
+    for s in group_stats(rows, key):
+        sections = f"{s['sections']}" + (f" ({s['dot_sections']} dots)" if s["dot_sections"] else "")
         lines.append(
-            f"  {value:<7} {sections:>15}  {cells:>6}  {tp:>5}  {fn:>5}  {fp:>5}  {share(tp, cells):>7}  "
-            f"{share(objects - fp, objects):>9}  " + (f"{np.mean(dice):>5.2f}" if dice else f"{'-':>5}")
+            f"  {s[key]:<7} {sections:>15}  {s['cells']:>6}  {s['true_positives']:>5}  {s['false_negatives']:>5}  "
+            f"{s['false_positives']:>5}  {share(s['true_positives'], s['cells']):>7}  "
+            f"{share(s['objects'] - s['false_positives'], s['objects']):>9}  "
+            + (f"{s['dice']:>5.2f}" if s["dice"] is not None else f"{'-':>5}")
         )
     return lines
+
+
+def write_slide_stats(rows, path):
+    """The per-slide table as a CSV: counts, recall and precision as fractions, mean Dice of outlined sections."""
+    columns = ["slide", "model", "sections", "dot_sections", "cells", "objects", "true_positives",
+               "false_negatives", "false_positives", "recall", "precision", "dice"]
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+        for s in group_stats(rows, "slide"):
+            writer.writerow({c: ("" if s[c] is None else round(s[c], 4) if isinstance(s[c], float) else s[c]) for c in columns})
 
 
 def summarise(rows, pooled, split, weights_path):
@@ -630,6 +678,7 @@ def main():
         writer = csv.DictWriter(f, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+    write_slide_stats(rows, os.path.join(out_dir, "slide_stats.csv"))
     save_gallery(examples, os.path.join(out_dir, "gallery.pdf"), rng)
 
     alarm_files = [os.path.join(out_dir, "false_positives.csv")]
