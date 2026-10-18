@@ -32,6 +32,10 @@ Results go to <data directory>/evaluation/<cv or split>_<date>_<time>/ :
     gallery.pdf            close-ups of false negatives, false positives and true positives
     sections_overview.pdf  one page per section showing where the true positives, false negatives and
                            false positives are
+    sections_overview_jpegs_overlay.pdf
+                           the same pages drawn on the sections' JPEGs, if a "jpegs" folder sits next to the
+                           section images (or --jpegs names one); JPEGs are matched to sections by name and
+                           must have the same size as the section images
     predicted_masks/       the predicted mask of every section as a PNG (0 = background, 255 = cell)
 
 Run on the training slides (--split train), it also writes hard_negatives.csv into the data directory:
@@ -40,6 +44,7 @@ that file and draws extra background patches at those places.
 """
 
 import argparse
+import contextlib
 import csv
 import json
 import os
@@ -260,12 +265,19 @@ def save_gallery(examples, path, rng):
     plt.close(fig)
 
 
-def add_overview_page(pdf, name, image, match, verdict, dice, model_name):
-    """One page: the whole section, shrunk, with every annotated cell and predicted object marked."""
+def add_overview_page(pdf, name, image, match, verdict, dice, model_name, background=None):
+    """One page: the whole section, shrunk, with every annotated cell and predicted object marked.
+
+    The section is drawn from `image` in gray, or from `background` when given: an RGB array of the same
+    size, such as the section's JPEG.
+    """
     step = max(1, max(image.shape) // 1200)
     found = verdict["found"]
     fig, ax = plt.subplots(figsize=(9, 9))
-    ax.imshow(image[::step, ::step], cmap="gray", vmin=0, vmax=max(np.percentile(image, 99.9), 1e-6))
+    if background is None:
+        ax.imshow(image[::step, ::step], cmap="gray", vmin=0, vmax=max(np.percentile(image, 99.9), 1e-6))
+    else:
+        ax.imshow(background[::step, ::step])
     for centres, style, label in [
         (
             match["cell_centres"][found],
@@ -493,6 +505,42 @@ def sets_of_model(weights_path, images, segs, data_dir):
     return {name: tr.files_for_slides(images, segs, slides[name]) for name in slides}, "slide"
 
 
+def jpeg_key(name):
+    """A section name in a form that matches its JPEG: "S001.tif_section_2_f" and "S001_tif_section_2_f" agree."""
+    return name.lower().replace(".", "_")
+
+
+def find_jpegs(images, jpeg_folder=None):
+    """(folder, {jpeg_key: path}) for the sections' JPEGs, or (None, {}) if there is no JPEG folder.
+
+    Without jpeg_folder, looks for a folder called "jpegs" next to the folder of section images, then inside it.
+    """
+    if jpeg_folder is None:
+        image_folder = os.path.dirname(os.path.abspath(images[0]))
+        candidates = [os.path.join(os.path.dirname(image_folder), "jpegs"), os.path.join(image_folder, "jpegs")]
+        jpeg_folder = next((c for c in candidates if os.path.isdir(c)), None)
+        if jpeg_folder is None:
+            return None, {}
+    elif not os.path.isdir(jpeg_folder):
+        raise SystemExit(f"{jpeg_folder} is not a folder")
+    paths = [p for p in glob(os.path.join(jpeg_folder, "*")) if os.path.splitext(p)[1].lower() in (".jpg", ".jpeg")]
+    return jpeg_folder, {jpeg_key(os.path.splitext(os.path.basename(p))[0]): p for p in paths}
+
+
+def load_jpeg(path, shape):
+    """The JPEG at path as an RGB array cut to shape (rows, columns), or None if its size doesn't fit.
+
+    Section images are sometimes trimmed by a pixel to match their mask (check_pair_shapes), so the JPEG is
+    cut from the top-left the same way; a size difference beyond SHAPE_TOLERANCE means it isn't the same image.
+    """
+    with Image.open(path) as jpeg:
+        rgb = np.asarray(jpeg.convert("RGB"))
+    rows, cols = shape
+    if not (0 <= rgb.shape[0] - rows <= tr.SHAPE_TOLERANCE and 0 <= rgb.shape[1] - cols <= tr.SHAPE_TOLERANCE):
+        return None
+    return rgb[:rows, :cols]
+
+
 def pairs_in_folders(image_folder, mask_folder):
     """Image/mask pairs from two folders (a new brain), matched by name and size-checked exactly as in training."""
     for folder in (image_folder, mask_folder):
@@ -514,6 +562,11 @@ def main():
     which.add_argument("--all", action="store_true", help="one model (--weights) on every section in --images / --masks")
     parser.add_argument("--images", help="with --all: the folder of section images (.tiff), e.g. of a new brain")
     parser.add_argument("--masks", help="with --all: the folder of their masks (.mat)")
+    parser.add_argument(
+        "--jpegs",
+        help='folder of the sections\' JPEGs for sections_overview_jpegs_overlay.pdf (default: a "jpegs" folder '
+        "next to the section images, if there is one)",
+    )
     parser.add_argument(
         "--weights",
         help=f"weights for --split and --all (default: {tr.MODEL_FOLDER}/final.pth in the data directory, "
@@ -579,10 +632,21 @@ def main():
     pooled = {"cell_iou": [], "cell_area": [], "matched_object_area": [], "false_alarm_area": [], "false_alarm_distance": []}
     rows, false_alarm_rows = [], []  # `pooled` covers the outlined sections only
 
+    # the sections' JPEGs, if there are any: the overview pages are drawn on them a second time
+    jpeg_folder, jpeg_paths = find_jpegs(images, args.jpegs)
+    jpeg_drawn, jpeg_missing, jpeg_wrong_size = [], [], []
+    if jpeg_folder:
+        print(f"JPEGs: {len(jpeg_paths)} in {jpeg_folder}; the overview will also be drawn on them")
+    else:
+        print('JPEGs: no "jpegs" folder next to the section images, so no JPEG overlay')
+
     n_sections = sum(len(files) for _, _, files in jobs)
     print(f"evaluating {n_sections} sections on {device}...")
     number = 0
-    with PdfPages(os.path.join(out_dir, "sections_overview.pdf")) as overview:
+    jpeg_pdf_path = os.path.join(out_dir, "sections_overview_jpegs_overlay.pdf")
+    with PdfPages(os.path.join(out_dir, "sections_overview.pdf")) as overview, (
+        PdfPages(jpeg_pdf_path) if jpeg_folder else contextlib.nullcontext()
+    ) as jpeg_overview:
         for model_name, weights, files in jobs:
             model = tr.build_model().to(device)
             model.load_state_dict(torch.load(weights, map_location=device))
@@ -667,6 +731,16 @@ def main():
                 for category, new in collect_examples(name, image, truth, predicted, match, verdict, rng).items():
                     examples[category] += new
                 add_overview_page(overview, name, image, match, verdict, dice, model_name)
+                if jpeg_overview is not None:
+                    jpeg_path = jpeg_paths.get(jpeg_key(name))
+                    background = None if jpeg_path is None else load_jpeg(jpeg_path, image.shape)
+                    if jpeg_path is None:
+                        jpeg_missing.append(name)
+                    elif background is None:
+                        jpeg_wrong_size.append(name)
+                    else:
+                        add_overview_page(jpeg_overview, name, image, match, verdict, dice, model_name, background)
+                        jpeg_drawn.append(name)
                 Image.fromarray(predicted.astype(np.uint8) * 255).save(os.path.join(out_dir, "predicted_masks", f"{name}.png"))
                 print(
                     f"  {number}/{n_sections} {name} [{kind}, {model_name}]: {match['n_true']} cells: "
@@ -701,6 +775,15 @@ def main():
         f.write("\n".join(lines) + "\n")
     print("\n" + "\n".join(lines))
     print(f"\nresults saved in {out_dir}")
+    if jpeg_folder:
+        print(f"JPEG overlay: {len(jpeg_drawn)} of {n_sections} sections drawn on their JPEG")
+        for problem, names in (("no JPEG found", jpeg_missing), ("JPEG of a different size, skipped", jpeg_wrong_size)):
+            if names:
+                print(f"  {problem} ({len(names)}): {', '.join(names[:10])}{' ...' if len(names) > 10 else ''}")
+        if not jpeg_drawn:
+            if os.path.exists(jpeg_pdf_path):
+                os.remove(jpeg_pdf_path)  # an empty PDF is no use
+            print("  no JPEG matched any section, so sections_overview_jpegs_overlay.pdf was not kept")
     if write_hard_negatives:
         print(
             f"{len(false_alarm_rows)} false positives on the training slides written to {alarm_files[-1]}; "
