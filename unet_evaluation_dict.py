@@ -33,9 +33,10 @@ Results go to <data directory>/evaluation/<cv or split>_<date>_<time>/ :
     sections_overview.pdf  one page per section showing where the true positives, false negatives and
                            false positives are
     sections_overview_jpegs_overlay.pdf
-                           the same pages drawn on the sections' JPEGs, if a "jpegs" folder sits next to the
-                           section images (or --jpegs names one); JPEGs are matched to sections by name and
-                           must have the same size as the section images
+                           the same pages drawn on the sections' JPEGs at full resolution, if a "jpegs" folder
+                           sits next to the section images (or --jpegs names one); JPEGs are matched to sections
+                           by name and must have the same size as the section images. The JPEG data is embedded
+                           unchanged, so the file is about as large as the JPEGs themselves
     predicted_masks/       the predicted mask of every section as a PNG (0 = background, 255 = cell)
 
 Run on the training slides (--split train), it also writes hard_negatives.csv into the data directory:
@@ -46,8 +47,10 @@ that file and draws extra background patches at those places.
 import argparse
 import contextlib
 import csv
+import io
 import json
 import os
+import zlib
 from datetime import datetime
 from glob import glob
 
@@ -265,44 +268,183 @@ def save_gallery(examples, path, rng):
     plt.close(fig)
 
 
-def add_overview_page(pdf, name, image, match, verdict, dice, model_name, background=None):
-    """One page: the whole section, shrunk, with every annotated cell and predicted object marked.
+# Overview squares: (label, colour as RGB 0-1). Drawn in this order, so false positives end up on top.
+MARKER_STYLES = [("true positive", (0.0, 1.0, 0.0)), ("false negative", (1.0, 0.0, 0.0)), ("false positive", (1.0, 0.0, 1.0))]
+MARKER_SIDE = 6.3   # points: side of a square (matplotlib marker size 40 = 6.3 pt squared)
+MARKER_LINE = 1.2   # points: line width of a square
 
-    The section is drawn from `image` in gray, or from `background` when given: an RGB array of the same
-    size, such as the section's JPEG.
-    """
+
+def overview_title(name, model_name, verdict, dice):
+    detail = {"dots": "dot markers", "empty": "empty mask"}.get(verdict["kind"], f"outlined cells, pixel Dice {dice:.2f}")
+    return f"{name} [{model_name}]  ({detail})"
+
+
+def overview_markers(match, verdict):
+    """[(label, colour, centres as (row, column) array)] for the true positives, false negatives, false positives."""
+    centres = [
+        match["cell_centres"][verdict["found"]],
+        match["cell_centres"][~verdict["found"]],
+        match["object_centres"][verdict["false_alarm"]],
+    ]
+    return [(label, colour, c) for (label, colour), c in zip(MARKER_STYLES, centres)]
+
+
+def add_overview_page(pdf, name, image, match, verdict, dice, model_name):
+    """One page: the whole section, shrunk, with every annotated cell and predicted object marked."""
     step = max(1, max(image.shape) // 1200)
-    found = verdict["found"]
     fig, ax = plt.subplots(figsize=(9, 9))
-    if background is None:
-        ax.imshow(image[::step, ::step], cmap="gray", vmin=0, vmax=max(np.percentile(image, 99.9), 1e-6))
-    else:
-        ax.imshow(background[::step, ::step])
-    for centres, style, label in [
-        (
-            match["cell_centres"][found],
-            {"marker": "s", "facecolors": "none", "edgecolors": "lime", "s": 40},
-            "true positive",
-        ),
-        (
-            match["cell_centres"][~found],
-            {"marker": "s", "facecolors": "none", "edgecolors": "red", "s": 40},
-            "false negative",
-        ),
-        (
-            match["object_centres"][verdict["false_alarm"]],
-            {"marker": "s", "facecolors": "none", "edgecolors": "magenta", "s": 40},
-            "false positive",
-        ),
-    ]:
-        ax.scatter(centres[:, 1] / step, centres[:, 0] / step, label=f"{label} ({len(centres)})", linewidths=1.2, **style)
+    ax.imshow(image[::step, ::step], cmap="gray", vmin=0, vmax=max(np.percentile(image, 99.9), 1e-6))
+    for label, colour, centres in overview_markers(match, verdict):
+        ax.scatter(
+            centres[:, 1] / step, centres[:, 0] / step, label=f"{label} ({len(centres)})",
+            marker="s", facecolors="none", edgecolors=[colour], s=MARKER_SIDE**2, linewidths=MARKER_LINE,
+        )
     ax.set_xticks([])
     ax.set_yticks([])
-    detail = {"dots": "dot markers", "empty": "empty mask"}.get(verdict["kind"], f"outlined cells, pixel Dice {dice:.2f}")
-    ax.set_title(f"{name} [{model_name}]  ({detail})")
+    ax.set_title(overview_title(name, model_name, verdict, dice))
     ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
+
+
+class JpegOverlayPdf:
+    """A PDF of the sections' JPEGs at full resolution, with the overview squares, title and legend on top.
+
+    Each JPEG is embedded byte for byte (no re-compression, no downsampling), so zooming in shows every pixel
+    of the original; the squares and text are vector graphics and stay sharp at any zoom. Pages are written
+    one at a time, so only one JPEG is in memory. Use as a context manager, or call close().
+    """
+
+    IMAGE_SIZE = 612.0   # points: the longer side of the drawn section (8.5 inches, like the matplotlib pages)
+    MARGIN = 18.0
+    TITLE_BAND = 26.0
+    TITLE_SIZE = 11.0
+    LEGEND_SIZE = 9.0
+
+    def __init__(self, path):
+        self.path = path
+        self.file = open(path, "wb")
+        self.offsets = {}
+        self.page_ids = []
+        self.next_id = 5  # 1: catalog, 2: page tree, 3: font, 4: legend transparency
+        self.file.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+        self._object(3, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>")
+        self._object(4, b"<< /Type /ExtGState /ca 0.9 >>")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def _object(self, number, body, stream=None):
+        self.offsets[number] = self.file.tell()
+        self.file.write(f"{number} 0 obj\n".encode() + body)
+        if stream is not None:
+            self.file.write(b"\nstream\n" + stream + b"\nendstream")
+        self.file.write(b"\nendobj\n")
+
+    def _new_id(self):
+        self.next_id += 1
+        return self.next_id - 1
+
+    @staticmethod
+    def _text(s):
+        """A PDF string literal (Helvetica, WinAnsi)."""
+        s = s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        return b"(" + s.encode("cp1252", "replace") + b")"
+
+    @staticmethod
+    def _text_width(s, size):
+        return 0.52 * size * len(s)  # Helvetica is about half an em wide per character on average
+
+    def add_page(self, jpeg_path, title, markers):
+        """One page: the JPEG at jpeg_path, with markers = [(label, colour, centres as (row, column))] on top."""
+        with Image.open(jpeg_path) as jpeg:
+            width, height, mode = jpeg.width, jpeg.height, jpeg.mode
+            if mode in ("RGB", "L"):
+                with open(jpeg_path, "rb") as f:
+                    data = f.read()
+            else:  # an unusual JPEG (e.g. CMYK): re-encode once as an RGB JPEG
+                buffer = io.BytesIO()
+                jpeg.convert("RGB").save(buffer, "JPEG", quality=95)
+                data, mode = buffer.getvalue(), "RGB"
+        colour_space = b"/DeviceGray" if mode == "L" else b"/DeviceRGB"
+        image_id = self._new_id()
+        self._object(
+            image_id,
+            b"<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace %s /BitsPerComponent 8 "
+            b"/Filter /DCTDecode /Length %d >>" % (width, height, colour_space, len(data)),
+            data,
+        )
+
+        # geometry, in points: the section fills IMAGE_SIZE along its longer side
+        scale = self.IMAGE_SIZE / max(width, height)
+        image_w, image_h = width * scale, height * scale
+        m = self.MARGIN
+        page_w, page_h = image_w + 2 * m, image_h + 2 * m + self.TITLE_BAND
+        ops = [b"q %.4f 0 0 %.4f %.4f %.4f cm /Im0 Do Q" % (image_w, image_h, m, m)]
+
+        # squares, centred on the pixels (rows count down from the top, PDF y counts up from the bottom)
+        half = MARKER_SIDE / 2
+        ops.append(b"%.2f w" % MARKER_LINE)
+        for _, (r, g, b), centres in markers:
+            if len(centres) == 0:
+                continue
+            ops.append(b"%.3f %.3f %.3f RG" % (r, g, b))
+            for row, col in centres:
+                x = m + (col + 0.5) * scale - half
+                y = m + (height - row - 0.5) * scale - half
+                ops.append(b"%.2f %.2f %.2f %.2f re" % (x, y, MARKER_SIDE, MARKER_SIDE))
+            ops.append(b"S")
+
+        # title, centred above the section
+        tx = max(m, page_w / 2 - self._text_width(title, self.TITLE_SIZE) / 2)
+        ty = m + image_h + (self.TITLE_BAND - self.TITLE_SIZE) / 2 + 2
+        ops.append(b"0 g BT /F1 %.1f Tf %.2f %.2f Td %s Tj ET" % (self.TITLE_SIZE, tx, ty, self._text(title)))
+
+        # legend in the upper right corner: white box at 90% opacity, one line per kind of square
+        entries = [(f"{label} ({len(centres)})", colour) for label, colour, centres in markers]
+        size, line, pad, gap = self.LEGEND_SIZE, self.LEGEND_SIZE * 1.45, 5.0, 6.0
+        box_w = pad + MARKER_SIDE + gap + max(self._text_width(t, size) for t, _ in entries) + pad
+        box_h = len(entries) * line + 2 * pad - (line - size)
+        box_x, box_y = m + image_w - 6 - box_w, m + image_h - 6 - box_h
+        ops.append(b"q /GS1 gs 1 g %.2f %.2f %.2f %.2f re f Q" % (box_x, box_y, box_w, box_h))
+        ops.append(b"0.8 G 0.5 w %.2f %.2f %.2f %.2f re S %.2f w" % (box_x, box_y, box_w, box_h, MARKER_LINE))
+        for i, (text, (r, g, b)) in enumerate(entries):
+            baseline = box_y + box_h - pad - size + 1.5 - i * line
+            square_y = baseline + size * 0.35 - half
+            ops.append(b"%.3f %.3f %.3f RG %.2f %.2f %.2f %.2f re S" % (r, g, b, box_x + pad, square_y, MARKER_SIDE, MARKER_SIDE))
+            ops.append(
+                b"0 g BT /F1 %.1f Tf %.2f %.2f Td %s Tj ET"
+                % (size, box_x + pad + MARKER_SIDE + gap, baseline, self._text(text))
+            )
+
+        content = zlib.compress(b"\n".join(ops))
+        content_id = self._new_id()
+        self._object(content_id, b"<< /Length %d /Filter /FlateDecode >>" % len(content), content)
+        page_id = self._new_id()
+        self._object(
+            page_id,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %.2f %.2f] /Resources << /Font << /F1 3 0 R >> "
+            b"/ExtGState << /GS1 4 0 R >> /XObject << /Im0 %d 0 R >> >> /Contents %d 0 R >>"
+            % (page_w, page_h, image_id, content_id),
+        )
+        self.page_ids.append(page_id)
+
+    def close(self):
+        if self.file.closed:
+            return
+        kids = b" ".join(b"%d 0 R" % i for i in self.page_ids)
+        self._object(2, b"<< /Type /Pages /Kids [%s] /Count %d >>" % (kids, len(self.page_ids)))
+        self._object(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+        xref = self.file.tell()
+        count = self.next_id
+        self.file.write(b"xref\n0 %d\n0000000000 65535 f \n" % count)
+        for number in range(1, count):
+            self.file.write(b"%010d 00000 n \n" % self.offsets[number])
+        self.file.write(b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (count, xref))
+        self.file.close()
 
 
 def share(part, whole):
@@ -527,18 +669,16 @@ def find_jpegs(images, jpeg_folder=None):
     return jpeg_folder, {jpeg_key(os.path.splitext(os.path.basename(p))[0]): p for p in paths}
 
 
-def load_jpeg(path, shape):
-    """The JPEG at path as an RGB array cut to shape (rows, columns), or None if its size doesn't fit.
+def jpeg_fits(path, shape):
+    """Whether the JPEG at path has the size of a section image of shape (rows, columns).
 
-    Section images are sometimes trimmed by a pixel to match their mask (check_pair_shapes), so the JPEG is
-    cut from the top-left the same way; a size difference beyond SHAPE_TOLERANCE means it isn't the same image.
+    Section images are sometimes trimmed by a pixel at the bottom or right to match their mask
+    (check_pair_shapes), so the JPEG may be that much larger; a bigger difference means another image.
     """
-    with Image.open(path) as jpeg:
-        rgb = np.asarray(jpeg.convert("RGB"))
+    with Image.open(path) as jpeg:  # reads the header only
+        width, height = jpeg.size
     rows, cols = shape
-    if not (0 <= rgb.shape[0] - rows <= tr.SHAPE_TOLERANCE and 0 <= rgb.shape[1] - cols <= tr.SHAPE_TOLERANCE):
-        return None
-    return rgb[:rows, :cols]
+    return 0 <= height - rows <= tr.SHAPE_TOLERANCE and 0 <= width - cols <= tr.SHAPE_TOLERANCE
 
 
 def pairs_in_folders(image_folder, mask_folder):
@@ -645,7 +785,7 @@ def main():
     number = 0
     jpeg_pdf_path = os.path.join(out_dir, "sections_overview_jpegs_overlay.pdf")
     with PdfPages(os.path.join(out_dir, "sections_overview.pdf")) as overview, (
-        PdfPages(jpeg_pdf_path) if jpeg_folder else contextlib.nullcontext()
+        JpegOverlayPdf(jpeg_pdf_path) if jpeg_folder else contextlib.nullcontext()
     ) as jpeg_overview:
         for model_name, weights, files in jobs:
             model = tr.build_model().to(device)
@@ -733,13 +873,14 @@ def main():
                 add_overview_page(overview, name, image, match, verdict, dice, model_name)
                 if jpeg_overview is not None:
                     jpeg_path = jpeg_paths.get(jpeg_key(name))
-                    background = None if jpeg_path is None else load_jpeg(jpeg_path, image.shape)
                     if jpeg_path is None:
                         jpeg_missing.append(name)
-                    elif background is None:
+                    elif not jpeg_fits(jpeg_path, image.shape):
                         jpeg_wrong_size.append(name)
                     else:
-                        add_overview_page(jpeg_overview, name, image, match, verdict, dice, model_name, background)
+                        jpeg_overview.add_page(
+                            jpeg_path, overview_title(name, model_name, verdict, dice), overview_markers(match, verdict)
+                        )
                         jpeg_drawn.append(name)
                 Image.fromarray(predicted.astype(np.uint8) * 255).save(os.path.join(out_dir, "predicted_masks", f"{name}.png"))
                 print(
