@@ -520,6 +520,8 @@ def summarise(rows, pooled, split, weights_path):
     lines = [
         f"evaluated: {split}   weights: {weights_path}   threshold: {THRESHOLD}   edge margin: {EDGE_MARGIN} px"
         f"   minimum object area: {MIN_OBJECT_AREA} px",
+        f"channel: raw channel {tr.RAW_CHANNEL}, mask {tr.MASK_KEY}"
+        + (f' ("{tr.channel_name()}")' if tr.channel_name() else ""),
         f"sections: {len(rows)}  ({len(by_kind['outlines'])} with outlined cells, {len(by_kind['dots'])} with dot markers, "
         f"{len(by_kind['empty'])} with an empty mask)",
         f"mean Dice per section over all sections with cells: "
@@ -617,6 +619,28 @@ def summarise(rows, pooled, split, weights_path):
             )
     lines += per_group_lines(rows, "slide", "PER SLIDE (anterior to posterior; Dice: mean over outlined sections)")
     return lines
+
+
+def check_channel(weights_path):
+    """Stop if the model was trained on another channel or mask than RAW_CHANNEL / MASK_KEY are set to now."""
+    info_path = tr.model_info_path(weights_path)
+    if not os.path.exists(info_path):
+        return
+    with open(info_path) as f:
+        info = json.load(f)
+    if "raw_channel" in info and (info["raw_channel"], info["mask_key"]) != (tr.RAW_CHANNEL, tr.MASK_KEY):
+        raise SystemExit(
+            f"{weights_path} was trained on raw channel {info['raw_channel']} with mask {info['mask_key']}, but "
+            f"unet_training_dict.py is set to raw channel {tr.RAW_CHANNEL} with mask {tr.MASK_KEY}: set RAW_CHANNEL "
+            "and MASK_KEY there to match the model"
+        )
+
+
+def results_label(args, model_name):
+    """Name of the results folder, before the time: cv_aav, val_aav_section, all_aav_section, test_section, ..."""
+    if args.cv:
+        return "cv" + (f"_{tr.channel_name()}" if tr.channel_name() else "")
+    return f"{'all' if args.all else args.split}_{model_name}"
 
 
 def sets_of_model(weights_path, images, segs, data_dir):
@@ -736,15 +760,18 @@ def main():
             weights = tr.model_path(data_dir, f"fold{k}")
             if not os.path.exists(weights):
                 raise SystemExit(f"{weights} not found: run python3 unet_training_dict.py --fold {k} first")
+            check_channel(weights)
             jobs.append((f"fold{k}", weights, sets_of_model(weights, images, segs, data_dir)[0]["val"]))
         label = "cross-validation, each fold model on its own validation slides"
-        weights_label = os.path.join(data_dir, tr.MODEL_FOLDER, f"fold0 ... fold{len(folds) - 1}")
+        weights_label = os.path.join(data_dir, tr.MODEL_FOLDER, tr.tagged(f"fold0 ... fold{len(folds) - 1}"))
+        model_name = None
     else:
         default_run = "section" if tr.SPLIT_MODE == "section" else "final"
         weights = args.weights or tr.model_path(data_dir, default_run)
         if not os.path.exists(weights):
             how = "python3 unet_training_dict.py" + ("" if default_run == "section" else " --final")
             raise SystemExit(f"{weights} not found: train it first ({how})")
+        check_channel(weights)
         model_name = os.path.splitext(os.path.basename(weights))[0]
         if args.all:
             # every section counts: none of them was seen in training
@@ -762,7 +789,7 @@ def main():
         weights_label = weights
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    run_label = "cv" if args.cv else f"{'all' if args.all else args.split}_{model_name}"
+    run_label = results_label(args, model_name)
     # results of a new brain go next to its image folder; everything else into the data directory
     results_root = os.path.dirname(os.path.abspath(args.images)) if args.all else data_dir
     out_dir = os.path.join(results_root, "evaluation", f"{run_label}_{datetime.now():%Y%m%d_%H%M%S}")
@@ -901,7 +928,7 @@ def main():
     # run; a section-split model trained on parts of every slide, so its false alarms are kept out of that file
     write_hard_negatives = args.split == "train" and mode == "slide"
     if write_hard_negatives:
-        alarm_files.append(os.path.join(data_dir, tr.HARD_NEGATIVE_FILE))
+        alarm_files.append(os.path.join(data_dir, tr.tagged(tr.HARD_NEGATIVE_FILE)))
     for path in alarm_files:
         with open(path, "w", newline="") as f:
             writer = csv.DictWriter(
@@ -931,7 +958,7 @@ def main():
             "unet_training_dict.py will use them as hard negatives"
         )
     elif args.split == "train":
-        print(f"{tr.HARD_NEGATIVE_FILE} left unchanged: hard negatives are only taken from slide-split models")
+        print(f"{tr.tagged(tr.HARD_NEGATIVE_FILE)} left unchanged: hard negatives are only taken from slide-split models")
 
 
 if __name__ == "__main__":

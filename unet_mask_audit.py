@@ -3,8 +3,9 @@
     python3 unet_mask_audit.py
 
 Reads only the masks (no model, no GPU). Prints one line per section and the totals per split, and
-saves the table as mask_audit.csv in the data directory. unet_training_dict.py and
-unet_evaluation_dict.py must sit next to this file.
+saves the table as mask_audit.csv in the data directory; for a named channel in CHANNEL_NAMES the name
+goes in front (aav_mask_audit.csv), since each mask (MASK_KEY) has its own dot-annotated sections.
+unet_training_dict.py and unet_evaluation_dict.py must sit next to this file.
 
 A mask counts as "dots" when (nearly) all of its objects have one and the same size, which is what
 point markers stamped at cell positions look like; otherwise it counts as "outlines".
@@ -58,7 +59,7 @@ def main():
             f"{row['most_common_area_px']} px{'   (size-trimmed pair)' if row['size_trimmed'] else ''}"
         )
 
-    out_path = os.path.join(data_dir, "mask_audit.csv")
+    out_path = os.path.join(data_dir, tr.tagged(tr.AUDIT_FILE))
     with open(out_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0]))
         writer.writeheader()

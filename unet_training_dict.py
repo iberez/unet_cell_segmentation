@@ -79,6 +79,12 @@ MODEL_FOLDER = "models"   # weights of each run (fold0.pth, fold1.pth, ..., fina
 RAW_CHANNEL = 0       # which channel of the TIFF to train on
 MASK_KEY = "BW_I2"    # which mask in the .mat goes with that channel
 
+# Names of channel/mask pairs. A named pair puts its name in front of every file and folder its runs create
+# (models/aav_section.pth, loss_vs_epochs_aav_section_<time>.pdf, evaluation/val_aav_section_<time>/,
+# aav_mask_audit.csv, ...), so the outputs of different channels never mix or overwrite each other.
+# The pair without a name (here channel 0 with BW_I2) keeps the plain names.
+CHANNEL_NAMES = {(1, "BW_I1"): "aav"}
+
 # --- masks that mark cells with fixed-size dots instead of outlines (listed by unet_mask_audit.py) ---
 EXCLUDE_DOT_MASKS = True       # leave those sections out of training and validation
 AUDIT_FILE = "mask_audit.csv"  # written into the data directory by unet_mask_audit.py
@@ -449,9 +455,19 @@ def run_files(images, segs, data_dir, run):
     )
 
 
+def channel_name():
+    """The name of the current RAW_CHANNEL / MASK_KEY pair in CHANNEL_NAMES, or "" if it has none."""
+    return CHANNEL_NAMES.get((RAW_CHANNEL, MASK_KEY), "")
+
+
+def tagged(name):
+    """name with the channel name in front ("aav_section.pth"), or unchanged when the channel has no name."""
+    return f"{channel_name()}_{name}" if channel_name() else name
+
+
 def model_path(data_dir, run):
-    """Where the weights of a run ("fold0", ..., "final") are kept."""
-    return os.path.join(data_dir, MODEL_FOLDER, f"{run}.pth")
+    """Where the weights of a run ("fold0", ..., "final", "section") are kept, for the current channel."""
+    return os.path.join(data_dir, MODEL_FOLDER, tagged(f"{run}.pth"))
 
 
 def model_info_path(weights_path):
@@ -520,8 +536,8 @@ def save_loss_plot(history, plot_dir, run):
     ax_dice.grid(alpha=0.3)
     ax_dice.legend(loc="lower right")
 
-    fig.suptitle(f"{run}: raw channel {RAW_CHANNEL}, mask {MASK_KEY}")
-    plot_path = os.path.join(plot_dir, f"loss_vs_epochs_{run}_{datetime.now():%Y%m%d_%H%M%S}.pdf")
+    fig.suptitle(f"{tagged(run)}: raw channel {RAW_CHANNEL}, mask {MASK_KEY}")
+    plot_path = os.path.join(plot_dir, f"loss_vs_epochs_{tagged(run)}_{datetime.now():%Y%m%d_%H%M%S}.pdf")
     fig.savefig(plot_path, transparent=True, bbox_inches="tight")
     plt.close(fig)
     return plot_path
@@ -529,9 +545,12 @@ def save_loss_plot(history, plot_dir, run):
 
 def drop_dot_sections(files, data_dir, split_name):
     """Remove the sections whose mask marks cells with dots, according to the audit file."""
-    audit_path = os.path.join(data_dir, AUDIT_FILE)
+    audit_path = os.path.join(data_dir, tagged(AUDIT_FILE))
     if not os.path.exists(audit_path):
-        raise SystemExit(f"{audit_path} not found: run unet_mask_audit.py first (it lists which masks are dots)")
+        raise SystemExit(
+            f"{audit_path} not found: run unet_mask_audit.py first, with the same RAW_CHANNEL and MASK_KEY "
+            "(it lists which masks are dots)"
+        )
     with open(audit_path, newline="") as f:
         kind_of = {row["section"]: row["annotation"] for row in csv.DictReader(f)}
     unknown = [section_key(item["image"]) for item in files if section_key(item["image"]) not in kind_of]
@@ -548,7 +567,7 @@ def load_hard_negatives(data_dir):
     Reads the file written by `python3 unet_evaluation_dict.py --split train`, keeping the false alarms
     that lie at least HARD_NEGATIVE_MIN_DISTANCE pixels from every annotated cell.
     """
-    path = os.path.join(data_dir, HARD_NEGATIVE_FILE)
+    path = os.path.join(data_dir, tagged(HARD_NEGATIVE_FILE))
     if HARD_NEGATIVE_SHARE <= 0 or not os.path.exists(path):
         return None
     positions = {}
@@ -632,6 +651,10 @@ def main(data_dir, run):
     # sections whose mask is empty can only give background patches; MONAI warns about each one, every epoch
     warnings.filterwarnings("ignore", message=".*unable to generate class balanced samples.*")
 
+    print(
+        f"channel: raw channel {RAW_CHANNEL}, mask {MASK_KEY}"
+        + (f' ("{channel_name()}": output names start with "{channel_name()}_")' if channel_name() else "")
+    )
     print(f"loading images and segmentations from {data_dir} (this may take a while)")
     images, segs = list_pairs(data_dir)
 
@@ -655,7 +678,7 @@ def main(data_dir, run):
     # hard negatives: false alarms of an earlier model on these sections, if they have been collected
     hard_negatives = load_hard_negatives(data_dir)
     if hard_negatives is None:
-        print(f"hard negatives: none in use (no {HARD_NEGATIVE_FILE}, or HARD_NEGATIVE_SHARE is 0)")
+        print(f"hard negatives: none in use (no {tagged(HARD_NEGATIVE_FILE)}, or HARD_NEGATIVE_SHARE is 0)")
         centre_step, centre_keys = [], {"image_key": "image", "image_threshold": 0}
     else:
         n_places = n_sections = 0
@@ -790,7 +813,7 @@ def main(data_dir, run):
 
     history = {}       # per-epoch numbers, filled by record_epoch()
     section_dice = []  # (epoch, mean whole-section validation Dice)
-    writer = SummaryWriter(comment=f"_{run}")
+    writer = SummaryWriter(comment=f"_{tagged(run)}")  # TensorBoard folder: runs/<date>_<host>_<channel>_<run>
     for epoch in range(NUM_EPOCHS):
         learning_rate = optimizer.param_groups[0]["lr"]
         model.train()
@@ -869,6 +892,9 @@ def main(data_dir, run):
         json.dump(
             {
                 "run": run,
+                "channel": channel_name(),
+                "raw_channel": RAW_CHANNEL,
+                "mask_key": MASK_KEY,
                 **record,
                 "epochs": NUM_EPOCHS,
                 "exclude_dot_masks": EXCLUDE_DOT_MASKS,
