@@ -484,15 +484,16 @@ def group_stats(rows, key):
 
 def per_group_lines(rows, key, title):
     """A small table with one line per model (key="model") or per slide (key="slide")."""
+    width = max([7] + [len(str(row[key])) for row in rows])
     lines = [
         "",
         title,
-        f"  {key:<7} {'sections':>15}  {'cells':>6}  {'TP':>5}  {'FN':>5}  {'FP':>5}  {'recall':>7}  {'precision':>9}  {'Dice':>5}",
+        f"  {key:<{width}} {'sections':>15}  {'cells':>6}  {'TP':>5}  {'FN':>5}  {'FP':>5}  {'recall':>7}  {'precision':>9}  {'Dice':>5}",
     ]
     for s in group_stats(rows, key):
         sections = f"{s['sections']}" + (f" ({s['dot_sections']} dots)" if s["dot_sections"] else "")
         lines.append(
-            f"  {s[key]:<7} {sections:>15}  {s['cells']:>6}  {s['true_positives']:>5}  {s['false_negatives']:>5}  "
+            f"  {s[key]:<{width}} {sections:>15}  {s['cells']:>6}  {s['true_positives']:>5}  {s['false_negatives']:>5}  "
             f"{s['false_positives']:>5}  {share(s['true_positives'], s['cells']):>7}  "
             f"{share(s['objects'] - s['false_positives'], s['objects']):>9}  "
             + (f"{s['dice']:>5.2f}" if s["dice"] is not None else f"{'-':>5}")
@@ -621,13 +622,20 @@ def summarise(rows, pooled, split, weights_path):
     return lines
 
 
-def check_channel(weights_path):
-    """Stop if the model was trained on another channel or mask than RAW_CHANNEL / MASK_KEY are set to now."""
+def check_channel(weights_path, check_brains=True):
+    """Stop if the model was trained on another channel or mask than RAW_CHANNEL / MASK_KEY are set to now, or
+    (with check_brains) with another MULTI_BRAIN setting, since its sections are then named differently.
+    """
     info_path = tr.model_info_path(weights_path)
     if not os.path.exists(info_path):
         return
     with open(info_path) as f:
         info = json.load(f)
+    if check_brains and info.get("multi_brain", False) != tr.MULTI_BRAIN:
+        raise SystemExit(
+            f"{weights_path} was trained with MULTI_BRAIN = {info.get('multi_brain', False)}, but unet_training_dict.py "
+            f"has MULTI_BRAIN = {tr.MULTI_BRAIN}: set it there to match the model"
+        )
     if "raw_channel" in info and (info["raw_channel"], info["mask_key"]) != (tr.RAW_CHANNEL, tr.MASK_KEY):
         raise SystemExit(
             f"{weights_path} was trained on raw channel {info['raw_channel']} with mask {info['mask_key']}, but "
@@ -639,7 +647,7 @@ def check_channel(weights_path):
 def results_label(args, model_name):
     """Name of the results folder, before the time: cv_aav, val_aav_section, all_aav_section, test_section, ..."""
     if args.cv:
-        return "cv" + (f"_{tr.channel_name()}" if tr.channel_name() else "")
+        return "_".join(["cv"] + tr.output_tags())
     return f"{'all' if args.all else args.split}_{model_name}"
 
 
@@ -666,7 +674,7 @@ def sets_of_model(weights_path, images, segs, data_dir):
     if "train_slides" in info:
         slides = {name: info[f"{name}_slides"] for name in ("train", "val", "test")}
     else:
-        assignment = tr.slide_assignment(images, os.path.join(data_dir, tr.SPLIT_FILE))
+        assignment = tr.slide_assignment(images, os.path.join(data_dir, tr.data_file(tr.SPLIT_FILE)))
         slides = {name: sorted(s for s, part in assignment.items() if part == name) for name in ("train", "val", "test")}
     return {name: tr.files_for_slides(images, segs, slides[name]) for name in slides}, "slide"
 
@@ -771,7 +779,7 @@ def main():
         if not os.path.exists(weights):
             how = "python3 unet_training_dict.py" + ("" if default_run == "section" else " --final")
             raise SystemExit(f"{weights} not found: train it first ({how})")
-        check_channel(weights)
+        check_channel(weights, check_brains=not args.all)  # --all names the new brain's sections itself
         model_name = os.path.splitext(os.path.basename(weights))[0]
         if args.all:
             # every section counts: none of them was seen in training
@@ -899,7 +907,7 @@ def main():
                     examples[category] += new
                 add_overview_page(overview, name, image, match, verdict, dice, model_name)
                 if jpeg_overview is not None:
-                    jpeg_path = jpeg_paths.get(jpeg_key(name))
+                    jpeg_path = jpeg_paths.get(jpeg_key(tr.section_name(item["image"])))
                     if jpeg_path is None:
                         jpeg_missing.append(name)
                     elif not jpeg_fits(jpeg_path, image.shape):

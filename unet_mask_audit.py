@@ -26,7 +26,7 @@ def main():
     images, segs = tr.list_pairs(data_dir)
 
     split_of = {}
-    split_path = os.path.join(data_dir, tr.SPLIT_FILE)
+    split_path = os.path.join(data_dir, tr.data_file(tr.SPLIT_FILE))
     if os.path.exists(split_path):
         for split, members in tr.split_by_slide(images, segs, split_path).items():
             for item in members:
@@ -54,7 +54,7 @@ def main():
         )
         row = rows[-1]
         print(
-            f"  {row['section']:<26} {row['split']:<5} {row['annotation']:<8} {n_cells:>5} cells, median area "
+            f"  {row['section']:<34} {row['split']:<5} {row['annotation']:<8} {n_cells:>5} cells, median area "
             f"{row['median_area_px']:>6.0f} px, {100 * row['share_with_that_area']:>3.0f}% are exactly "
             f"{row['most_common_area_px']} px{'   (size-trimmed pair)' if row['size_trimmed'] else ''}"
         )

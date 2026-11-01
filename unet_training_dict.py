@@ -74,6 +74,16 @@ from monai.visualize import plot_2d_or_3d_image
 DATA_DIR = "/zjbd/zd1/isaac/rabies_cnn"
 IMAGE_FOLDER = "112_02_single_section_raw_input"
 MASK_FOLDER = "112_02_single_section_seg_masks"
+
+# --- one brain or several ---
+# False: train and validate on the brain in IMAGE_FOLDER and MASK_FOLDER only.
+# True:  use every brain in DATA_DIR. Each folder directly in DATA_DIR whose name contains "_raw_input" holds a
+#        brain's section images, and the folder with the same name but "_seg_masks" holds its masks
+#        (111_02_single_section_raw_input with 111_02_single_section_seg_masks, and so on). Every brain has its own
+#        S001, S002, ..., so section and slide names then start with the brain ("111_02_S001.tif_section_1_f",
+#        slide "111_02_S001"), and the split, model, loss-plot, audit and hard-negative files get "multibrain_" in
+#        front of their names, so the single-brain files are never read or overwritten by a multi-brain run.
+MULTI_BRAIN = True
 MODEL_FOLDER = "models"   # weights of each run (fold0.pth, fold1.pth, ..., final.pth), each with a .json record
 
 RAW_CHANNEL = 0       # which channel of the TIFF to train on
@@ -244,8 +254,8 @@ def check_pair_shapes(images, segs):
     return kept_images, kept_segs
 
 
-def section_key(path):
-    """Name shared by a section's image and its mask.
+def section_name(path):
+    """Name shared by a section's image and its mask, within one brain.
 
     'S013.tif_section_4_f.tiff' and 'BW_I1_I2_S013.tif_section_4_f_rev.mat'
     both give 'S013.tif_section_4_f'.
@@ -254,12 +264,36 @@ def section_key(path):
     return name.removeprefix("BW_I1_I2_").removesuffix("_rev")
 
 
+def brain_of(path):
+    """The brain a section file belongs to, from its folder: '111_02' for .../111_02_single_section_raw_input/x.tiff."""
+    folder = os.path.basename(os.path.dirname(os.path.abspath(path)))
+    for marker in ("_raw_input", "_seg_masks"):
+        if marker in folder:
+            return folder.split(marker)[0].removesuffix("_single_section")
+    return folder
+
+
+def default_brain():
+    """The brain in IMAGE_FOLDER: '112_02'."""
+    return brain_of(os.path.join(IMAGE_FOLDER, "x.tiff"))
+
+
+def section_key(path):
+    """The name a section goes by in splits, records and results: the section name, with its brain in front
+    when MULTI_BRAIN is on ('112_02_S013.tif_section_4_f'), since every brain has its own S001, S002, ...
+    """
+    return f"{brain_of(path)}_{section_name(path)}" if MULTI_BRAIN else section_name(path)
+
+
 def pair_by_name(images, segs):
-    """Keep only images that have a mask, matched by section name rather than list position."""
-    mask_for = {section_key(p): p for p in segs}
-    image_keys = [section_key(p) for p in images]
+    """Keep only images that have a mask, matched by section name rather than list position.
+
+    Images and masks are expected to come from one brain.
+    """
+    mask_for = {section_name(p): p for p in segs}
+    image_keys = [section_name(p) for p in images]
     if len(mask_for) != len(segs) or len(set(image_keys)) != len(images):
-        raise ValueError("Two files map to the same section name; adjust section_key().")
+        raise ValueError("Two files map to the same section name; adjust section_name().")
 
     pairs = [(p, mask_for[k]) for p, k in zip(images, image_keys) if k in mask_for]
     images_without_mask = [os.path.basename(p) for p, k in zip(images, image_keys) if k not in mask_for]
@@ -268,12 +302,12 @@ def pair_by_name(images, segs):
     print(f"images without a mask ({len(images_without_mask)}): {images_without_mask}")
     print(f"masks without an image ({len(masks_without_image)}): {masks_without_image}")
     if not pairs:
-        raise ValueError("No image/mask pairs matched by name; adjust section_key().")
+        raise ValueError("No image/mask pairs matched by name; adjust section_name().")
     return [p[0] for p in pairs], [p[1] for p in pairs]
 
 
 def slide_of(path):
-    """The scanned slide a section was cut from: 'S013' for 'S013.tif_section_4_f.tiff'."""
+    """The scanned slide a section was cut from: 'S013' for 'S013.tif_section_4_f.tiff' ('112_02_S013' with MULTI_BRAIN)."""
     return section_key(path).split(".tif_section_")[0]
 
 
@@ -326,11 +360,11 @@ def load_folds(images, data_dir):
     the other slides, in anterior-to-posterior order, round-robin over N_FOLDS groups, so that every group
     spans the whole axis. Both files are reused afterwards.
     """
-    assignment = slide_assignment(images, os.path.join(data_dir, SPLIT_FILE))
+    assignment = slide_assignment(images, os.path.join(data_dir, data_file(SPLIT_FILE)))
     test_slides = sorted(s for s, part in assignment.items() if part == "test")
     other_slides = sorted(s for s, part in assignment.items() if part != "test")
 
-    fold_path = os.path.join(data_dir, FOLD_FILE)
+    fold_path = os.path.join(data_dir, data_file(FOLD_FILE))
     if os.path.exists(fold_path):
         with open(fold_path) as f:
             folds = json.load(f)["folds"]
@@ -386,6 +420,10 @@ def split_by_section(images, segs, split_path):
     mounting, imaging and here annotation style, so validation and test then measure performance on
     slides the model has seen. The assignment is written to split_path the first time and read back on
     every later run, so the test sections stay the same.
+
+    With MULTI_BRAIN, a new split is drawn over the slides of all brains, except that the sections of the
+    default brain (IMAGE_FOLDER) keep the assignment they have in the single-brain SECTION_SPLIT_FILE, if that
+    file exists: its test sections then stay unseen, and single- and multi-brain models can be compared on them.
     """
     keys = [section_key(p) for p in images]
     if os.path.exists(split_path):
@@ -407,16 +445,17 @@ def split_by_section(images, segs, split_path):
             n_test = int(len(members) * SECTION_SPLIT_SHARES["test"] + 0.5)
             for rank, i in enumerate(rng.permutation(len(members))):
                 section_split[members[i]] = "val" if rank < n_val else "test" if rank < n_val + n_test else "train"
+        note = "section -> split, drawn at random within each slide; delete this file to redo the split"
+        single_brain_path = os.path.join(os.path.dirname(split_path), SECTION_SPLIT_FILE)
+        if MULTI_BRAIN and os.path.exists(single_brain_path):
+            with open(single_brain_path) as f:
+                kept = {f"{default_brain()}_{name}": part for name, part in json.load(f)["sections"].items()}
+            kept = {key: part for key, part in kept.items() if key in section_split}
+            section_split.update(kept)
+            note += f"; the {len(kept)} sections of {default_brain()} keep their assignment from {SECTION_SPLIT_FILE}"
+            print(f"  {len(kept)} sections of {default_brain()} keep their train / val / test assignment from {single_brain_path}")
         with open(split_path, "w") as f:
-            json.dump(
-                {
-                    "note": "section -> split, drawn at random within each slide; delete this file to redo the split",
-                    "seed": SECTION_SPLIT_SEED,
-                    "sections": section_split,
-                },
-                f,
-                indent=2,
-            )
+            json.dump({"note": note, "seed": SECTION_SPLIT_SEED, "sections": section_split}, f, indent=2)
         print(f"new split written to {split_path}")
 
     files = {"train": [], "val": [], "test": []}
@@ -424,7 +463,8 @@ def split_by_section(images, segs, split_path):
         files[section_split[key]].append({"image": image, "label": seg})
     for name, members in files.items():
         slides = sorted({slide_of(item["image"]) for item in members})
-        print(f"  {name}: {len(members)} sections from {len(slides)} slides")
+        brains = sorted({brain_of(item["image"]) for item in members})
+        print(f"  {name}: {len(members)} sections from {len(slides)} slides" + (f" of {len(brains)} brains" if MULTI_BRAIN else ""))
     return files
 
 
@@ -435,7 +475,7 @@ def run_files(images, segs, data_dir, run):
     """
     if run == "section":
         print(f"run {run}: sections drawn at random within each slide")
-        files = split_by_section(images, segs, os.path.join(data_dir, SECTION_SPLIT_FILE))
+        files = split_by_section(images, segs, os.path.join(data_dir, data_file(SECTION_SPLIT_FILE)))
         record = {"split_mode": "section"}
         for name in ("train", "val", "test"):
             record[f"{name}_sections"] = sorted(section_key(item["image"]) for item in files[name])
@@ -460,9 +500,19 @@ def channel_name():
     return CHANNEL_NAMES.get((RAW_CHANNEL, MASK_KEY), "")
 
 
-def tagged(name):
-    """name with the channel name in front ("aav_section.pth"), or unchanged when the channel has no name."""
-    return f"{channel_name()}_{name}" if channel_name() else name
+def output_tags(with_brains=True):
+    """What goes in front of output names: the channel name (if any) and "multibrain" (if MULTI_BRAIN is on)."""
+    return [tag for tag in (channel_name(), "multibrain" if MULTI_BRAIN and with_brains else "") if tag]
+
+
+def tagged(name, with_brains=True):
+    """name with the output tags in front ("aav_section.pth", "aav_multibrain_section.pth"), or unchanged without tags."""
+    return "_".join(output_tags(with_brains) + [name])
+
+
+def data_file(name):
+    """A split file's name: "multibrain_" in front when MULTI_BRAIN is on. Not per channel: all channels share a split."""
+    return f"multibrain_{name}" if MULTI_BRAIN else name
 
 
 def model_path(data_dir, run):
@@ -566,15 +616,20 @@ def load_hard_negatives(data_dir):
 
     Reads the file written by `python3 unet_evaluation_dict.py --split train`, keeping the false alarms
     that lie at least HARD_NEGATIVE_MIN_DISTANCE pixels from every annotated cell.
+    With MULTI_BRAIN and no multi-brain file yet, the single-brain file of the same channel is used: its positions
+    lie on sections of the default brain (IMAGE_FOLDER), so they still apply there.
     """
-    path = os.path.join(data_dir, tagged(HARD_NEGATIVE_FILE))
+    path, prefix = os.path.join(data_dir, tagged(HARD_NEGATIVE_FILE)), ""
+    if MULTI_BRAIN and not os.path.exists(path):
+        path, prefix = os.path.join(data_dir, tagged(HARD_NEGATIVE_FILE, with_brains=False)), f"{default_brain()}_"
     if HARD_NEGATIVE_SHARE <= 0 or not os.path.exists(path):
         return None
+    print(f"hard negatives from {path}" + (f" (all on {default_brain()} sections)" if prefix else ""))
     positions = {}
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
             if float(row["distance_to_cell_px"]) >= HARD_NEGATIVE_MIN_DISTANCE:
-                positions.setdefault(row["section"], []).append((int(row["row"]), int(row["col"])))
+                positions.setdefault(prefix + row["section"], []).append((int(row["row"]), int(row["col"])))
     return {section: np.array(points, dtype=np.int64) for section, points in positions.items()}
 
 
@@ -619,18 +674,54 @@ class AddSamplingCentres(Transform):
         return d
 
 
-def list_pairs(data_dir):
-    """All usable image/mask pairs in data_dir: matched by name, then checked for size."""
-    images = sorted(glob(os.path.join(data_dir, IMAGE_FOLDER, "*.tiff")))
-    segs = sorted(glob(os.path.join(data_dir, MASK_FOLDER, "*.mat")))
-    print (f"len images: {len(images)}")
-    print (f"len segs: {len(segs)}")
+def brain_folders(data_dir):
+    """[(image folder, mask folder)] of the brains to use: the default pair, or with MULTI_BRAIN every
+    "_raw_input" folder directly in data_dir together with its "_seg_masks" folder.
+    """
+    if not MULTI_BRAIN:
+        return [(os.path.join(data_dir, IMAGE_FOLDER), os.path.join(data_dir, MASK_FOLDER))]
+    entries = sorted(e for e in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, e)))
+    image_folders = [e for e in entries if "_raw_input" in e]
+    mask_folders = {e for e in entries if "_seg_masks" in e}
+    pairs = []
+    for folder in image_folders:
+        masks = folder.replace("_raw_input", "_seg_masks")
+        if masks in mask_folders:
+            pairs.append((os.path.join(data_dir, folder), os.path.join(data_dir, masks)))
+            mask_folders.discard(masks)
+        else:
+            print(f"WARNING: {folder} has no {masks} folder next to it; that brain is left out")
+    for masks in sorted(mask_folders):
+        print(f"WARNING: {masks} has no matching _raw_input folder; it is left out")
+    if not pairs:
+        raise SystemExit(f'MULTI_BRAIN is on, but {data_dir} holds no "_raw_input" folder with a matching "_seg_masks" folder')
+    return pairs
 
-    # pair each image with its own mask by name (the two folders differ in length)
-    images, segs = pair_by_name(images, segs)
+
+def list_pairs(data_dir):
+    """All usable image/mask pairs: matched by name within each brain, then checked for size."""
+    all_images, all_segs = [], []
+    folders = brain_folders(data_dir)
+    if MULTI_BRAIN:
+        print(f"brains ({len(folders)}): {', '.join(brain_of(os.path.join(f, 'x')) for f, _ in folders)}")
+    for image_folder, mask_folder in folders:
+        images = sorted(glob(os.path.join(image_folder, "*.tiff")))
+        segs = sorted(glob(os.path.join(mask_folder, "*.mat")))
+        if MULTI_BRAIN:
+            print(f"brain {brain_of(os.path.join(image_folder, 'x'))}:")
+        print (f"len images: {len(images)}")
+        print (f"len segs: {len(segs)}")
+        # pair each image with its own mask by name (the two folders differ in length)
+        images, segs = pair_by_name(images, segs)
+        all_images += images
+        all_segs += segs
+
+    keys = [section_key(p) for p in all_images]
+    if len(set(keys)) != len(keys):
+        raise SystemExit("two sections have the same name in different brain folders; give the brains distinct folder names")
 
     # every image must be the same size as its mask (checked from the file headers, for all pairs)
-    return check_pair_shapes(images, segs)
+    return check_pair_shapes(all_images, all_segs)
 
 
 def build_model():
@@ -655,6 +746,7 @@ def main(data_dir, run):
         f"channel: raw channel {RAW_CHANNEL}, mask {MASK_KEY}"
         + (f' ("{channel_name()}": output names start with "{channel_name()}_")' if channel_name() else "")
     )
+    print(f"brains: {'all in ' + data_dir if MULTI_BRAIN else default_brain()} (MULTI_BRAIN = {MULTI_BRAIN})")
     print(f"loading images and segmentations from {data_dir} (this may take a while)")
     images, segs = list_pairs(data_dir)
 
@@ -895,6 +987,8 @@ def main(data_dir, run):
                 "channel": channel_name(),
                 "raw_channel": RAW_CHANNEL,
                 "mask_key": MASK_KEY,
+                "multi_brain": MULTI_BRAIN,
+                "brains": sorted({brain_of(item["image"]) for item in train_files + val_files}),
                 **record,
                 "epochs": NUM_EPOCHS,
                 "exclude_dot_masks": EXCLUDE_DOT_MASKS,
