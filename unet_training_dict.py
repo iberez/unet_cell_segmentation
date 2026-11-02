@@ -83,11 +83,11 @@ MASK_FOLDER = "112_02_single_section_seg_masks"
 #        S001, S002, ..., so section and slide names then start with the brain ("111_02_S001.tif_section_1_f",
 #        slide "111_02_S001"), and the split, model, loss-plot, audit and hard-negative files get "multibrain_" in
 #        front of their names, so the single-brain files are never read or overwritten by a multi-brain run.
-MULTI_BRAIN = True
+MULTI_BRAIN = False
 MODEL_FOLDER = "models"   # weights of each run (fold0.pth, fold1.pth, ..., final.pth), each with a .json record
 
-RAW_CHANNEL = 0       # which channel of the TIFF to train on
-MASK_KEY = "BW_I2"    # which mask in the .mat goes with that channel
+RAW_CHANNEL = 1       # which channel of the TIFF to train on
+MASK_KEY = "BW_I1"    # which mask in the .mat goes with that channel
 
 # Names of channel/mask pairs. A named pair puts its name in front of every file and folder its runs create
 # (models/aav_section.pth, loss_vs_epochs_aav_section_<time>.pdf, evaluation/val_aav_section_<time>/,

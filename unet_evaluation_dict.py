@@ -6,7 +6,10 @@
     python3 unet_evaluation_dict.py --split train  # one model on its own training set (slide split: writes hard negatives)
     python3 unet_evaluation_dict.py --all --images DIR --masks DIR   # one model on every section of a new brain
 
---weights picks the model for --split and --all. By default that is models/final.pth when SPLIT_MODE in
+--weights picks the model for --split and --all: a path, or just its name in the models folder ("aav_section").
+The model is evaluated with the channel, mask and MULTI_BRAIN setting recorded next to its weights, whatever
+unet_training_dict.py is set to now. Without --weights, the model is the one the current settings point to:
+models/final.pth when SPLIT_MODE in
 unet_training_dict.py is "slide", and models/section.pth when it is "section". Which sections a model
 trained, validated and is tested on is read from the .json record saved next to its weights; weights
 without one were trained on the original slide split in split_by_slide.json.
@@ -644,6 +647,51 @@ def check_channel(weights_path, check_brains=True):
         )
 
 
+def resolve_weights(name, data_dir):
+    """The weights file for --weights: a path, or a model's name in the models folder ("aav_section",
+    "aav_section.pth" or its record "aav_section.json")."""
+    candidates = [name]
+    if name.endswith(".json"):
+        candidates = [name[: -len(".json")] + ".pth"]
+    if not candidates[0].endswith(".pth"):
+        candidates.append(name + ".pth")
+    candidates += [os.path.join(data_dir, tr.MODEL_FOLDER, os.path.basename(c)) for c in list(candidates)]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    raise SystemExit(f"{name} not found (also looked for {', '.join(candidates[1:])})")
+
+
+def adopt_model_settings(weights_path):
+    """Set RAW_CHANNEL, MASK_KEY and MULTI_BRAIN to what the model was trained with, as its record says.
+
+    Records written before the channel was recorded keep the current RAW_CHANNEL and MASK_KEY. Every model
+    trained before MULTI_BRAIN existed was trained on one brain.
+    """
+    info = {}
+    info_path = tr.model_info_path(weights_path)
+    if os.path.exists(info_path):
+        with open(info_path) as f:
+            info = json.load(f)
+    before = (tr.RAW_CHANNEL, tr.MASK_KEY, tr.MULTI_BRAIN)
+    if "raw_channel" in info:
+        tr.RAW_CHANNEL, tr.MASK_KEY = info["raw_channel"], info["mask_key"]
+        where = "as recorded with the model"
+    else:
+        where = "from unet_training_dict.py (this model's record doesn't name its channel)"
+    tr.MULTI_BRAIN = bool(info.get("multi_brain", False))
+    print(
+        f"model {weights_path}: raw channel {tr.RAW_CHANNEL}, mask {tr.MASK_KEY}"
+        + (f' ("{tr.channel_name()}")' if tr.channel_name() else "")
+        + f", {'several brains' if tr.MULTI_BRAIN else 'one brain'}; channel and mask {where}"
+    )
+    if (tr.RAW_CHANNEL, tr.MASK_KEY, tr.MULTI_BRAIN) != before:
+        print(
+            f"NOTE: unet_training_dict.py is set to raw channel {before[0]}, mask {before[1]}, MULTI_BRAIN = {before[2]}; "
+            "this evaluation uses the model's settings instead"
+        )
+
+
 def results_label(args, model_name):
     """Name of the results folder, before the time: cv_aav, val_aav_section, all_aav_section, test_section, ..."""
     if args.cv:
@@ -741,8 +789,8 @@ def main():
     )
     parser.add_argument(
         "--weights",
-        help=f"weights for --split and --all (default: {tr.MODEL_FOLDER}/final.pth in the data directory, "
-        f"or {tr.MODEL_FOLDER}/section.pth when SPLIT_MODE is section)",
+        help=f"model for --split and --all: a path or a name in {tr.MODEL_FOLDER}/ (e.g. aav_section); evaluated with "
+        "the channel and mask it was trained on (default: the model the settings in unet_training_dict.py point to)",
     )
     args = parser.parse_args()
     if args.cv and args.weights:
@@ -753,6 +801,18 @@ def main():
         parser.error("--images and --masks go with --all")
 
     data_dir = tr.DATA_DIR  # where the trained models are
+    if not args.cv:
+        # one model: evaluate it with the channel, mask and brain setting it was trained with
+        if args.weights:
+            weights = resolve_weights(args.weights, data_dir)
+        else:
+            default_run = "section" if tr.SPLIT_MODE == "section" else "final"
+            weights = tr.model_path(data_dir, default_run)
+            if not os.path.exists(weights):
+                how = "python3 unet_training_dict.py" + ("" if default_run == "section" else " --final")
+                raise SystemExit(f"{weights} not found: train it first ({how}), or name a model with --weights")
+        adopt_model_settings(weights)
+
     if args.all:
         # a new brain: every image/mask pair in the two folders given
         images, segs = pairs_in_folders(args.images, args.masks)
@@ -774,12 +834,6 @@ def main():
         weights_label = os.path.join(data_dir, tr.MODEL_FOLDER, tr.tagged(f"fold0 ... fold{len(folds) - 1}"))
         model_name = None
     else:
-        default_run = "section" if tr.SPLIT_MODE == "section" else "final"
-        weights = args.weights or tr.model_path(data_dir, default_run)
-        if not os.path.exists(weights):
-            how = "python3 unet_training_dict.py" + ("" if default_run == "section" else " --final")
-            raise SystemExit(f"{weights} not found: train it first ({how})")
-        check_channel(weights, check_brains=not args.all)  # --all names the new brain's sections itself
         model_name = os.path.splitext(os.path.basename(weights))[0]
         if args.all:
             # every section counts: none of them was seen in training
